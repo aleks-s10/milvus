@@ -1,0 +1,64 @@
+# Test branch only, never proposed upstream: builds and checks the FIPS modes on x86-64.
+name: FIPS x86-64
+on:
+  push:
+    branches: [ci/fips-x86-test]
+jobs:
+  fips:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [strict, default]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: rui314/setup-mold@v1
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 16G /extra.swap && sudo chmod 600 /extra.swap && sudo mkswap /extra.swap >/dev/null && sudo swapon /extra.swap
+          df -h / ; free -h ; nproc
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+      - name: Build
+        run: |
+          FLAGS=""; [ "${{ matrix.mode }}" = strict ] && FLAGS="MILVUS_FIPS_ENABLED=ON MILVUS_FIPS_STRICT=ON"
+          ./build/builder.sh /bin/bash -c "set -o pipefail; make install $FLAGS 2>&1 | tee build.log | grep -E 'Installation successful|FAILED:|fatal error|Error [0-9]+$' || true; test \${PIPESTATUS[0]} -eq 0"
+          tail -3 build.log; grep -q 'Installation successful' build.log
+      - uses: ./.github/actions/cache-save
+        if: always()
+        continue-on-error: true
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+      - name: Rebuild provider with gcc 11.2.0
+        if: matrix.mode == 'strict'
+        run: |
+          docker run --rm --platform linux/amd64 -v "$PWD:/r" -w /r ubuntu:jammy-20240530 bash .ci-fips/provider.sh | tee provider.log
+          grep -q 'INSTALL PASSED' provider.log
+          grep -q 'GCC: (Ubuntu 11.2.0-19ubuntu1) 11.2.0' provider.log
+          sudo cp internal/core/output/lib/ossl-modules/fips.so lib/ossl-modules/fips.so
+          sudo chown -R "$(id -u)" configs/ssl lib/ossl-modules
+      - name: Build image
+        run: |
+          df -h /
+          docker build --network host --build-arg TARGETARCH=amd64 --platform linux/amd64 -f build/docker/milvus/ubuntu22.04/Dockerfile -t fipslocal/milvus:ci . > image.log 2>&1 || { tail -30 image.log; exit 1; }
+          docker images fipslocal/milvus:ci
+      - name: Runtime checks
+        run: bash .ci-fips/run-checks.sh ${{ matrix.mode }} 2>&1 | tee checks.log; exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fips-x86-${{ matrix.mode }}
+          path: |
+            build.log
+            provider.log
+            image.log
+            checks.log
+            .ci-fips/logs/
+          if-no-files-found: ignore
