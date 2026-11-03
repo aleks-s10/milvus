@@ -24,11 +24,12 @@ package fips
 #include <openssl/evp.h>
 #include <openssl/provider.h>
 #include <openssl/rand.h>
+#include <stdlib.h>
 
-static int enableOpenSSLFIPS() {
+static int enableOpenSSLFIPS(const char *config) {
 	unsigned char buf[1];
 
-	if (!OSSL_LIB_CTX_load_config(NULL, "/milvus/configs/ssl/openssl-fips.cnf")) {
+	if (!OSSL_LIB_CTX_load_config(NULL, config)) {
 		return -1;  // config load failed
 	}
 	if (!EVP_default_properties_is_fips_enabled(NULL)) {
@@ -48,6 +49,7 @@ import "C"
 import (
 	"log"
 	"sync"
+	"unsafe"
 )
 
 var (
@@ -57,7 +59,9 @@ var (
 
 func MaybeEnableOpenSSLFIPS() bool {
 	fipsOnce.Do(func() {
-		rc := C.enableOpenSSLFIPS()
+		config := C.CString(opensslFIPSConfigPath)
+		defer C.free(unsafe.Pointer(config))
+		rc := C.enableOpenSSLFIPS(config)
 		switch rc {
 		case 1:
 			log.Println("OpenSSL FIPS mode enabled")
@@ -68,6 +72,11 @@ func MaybeEnableOpenSSLFIPS() bool {
 			log.Println("FATAL: OpenSSL FIPS property set but FIPS provider not functional (check OPENSSL_MODULES env var and .include path in openssl-fips.cnf)")
 		default:
 			log.Println("Failed to load OpenSSL FIPS config")
+		}
+		// A strict build promises FIPS-only crypto, so it must not fall back to
+		// running without it the way a MILVUS_FIPS_ENABLED=ON build does.
+		if StrictMode() && !opensslFIPSEnabled {
+			log.Fatalf("MILVUS_FIPS_STRICT build could not enable OpenSSL FIPS mode using %s", opensslFIPSConfigPath)
 		}
 	})
 	return opensslFIPSEnabled
