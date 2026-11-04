@@ -3,6 +3,9 @@ name: FIPS strict build checks
 # A full MILVUS_FIPS_STRICT build takes hours, so this covers the fipsstrict tag
 # combinations and the Makefile guards when those files change.
 on:
+  push:
+    branches:
+      - ci/fips-strict-workflow-test
   pull_request:
     paths:
       - 'pkg/util/fips/**'
