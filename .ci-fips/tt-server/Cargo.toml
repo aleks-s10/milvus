@@ -1,0 +1,16 @@
+[package]
+name = "tt-server"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+tonic = "0.13.1"
+prost = "0.13.5"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tokio-openssl = "0.6"
+openssl = "0.10"
+openssl-sys = "0.9"
+foreign-types = "0.3"
+futures = "0.3"
+libc = "0.2"
+[build-dependencies]
+tonic-build = "0.13.1"

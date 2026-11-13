@@ -1,0 +1,35 @@
+minio:
+  address: azurite
+  port: 10000
+  accessKeyID: devstoreaccount1
+  secretAccessKey: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+  useSSL: true
+  bucketName: milvus-v3
+  rootPath: files
+  useIAM: false
+  cloudProvider: azure
+common:
+  storage:
+    useLoonFFI: true
+  security:
+    authorizationEnabled: true
+    passwordHashAlgorithm: pbkdf2-sha512
+queryNode:
+  segcore:
+    tieredStorage:
+      warmup:
+        scalarField: disable
+        scalarIndex: disable
+        vectorField: disable
+        vectorIndex: disable
+      evictionEnabled: true
+      backgroundEvictionEnabled: true
+      cacheTtl: 5
+dataNode:
+  text:
+    inlineThreshold: 16777216
+function:
+  analyzer:
+    lindera:
+      download_urls:
+        ipadic: https://Lindera.dev/mecab-ipadic-2.7.0-20070801.tar.gz

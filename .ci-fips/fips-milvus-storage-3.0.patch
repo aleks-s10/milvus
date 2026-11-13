@@ -1,0 +1,1988 @@
+diff --git a/cpp/CMakeLists.txt b/cpp/CMakeLists.txt
+index c1f132b..e877b5e 100644
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -13,6 +13,7 @@ option(WITH_JNI "Build with JNI library." OFF)
+ option(WITH_PYTHON_BINDING "Build for Python bindings with hidden symbols." OFF)
+ option(WITH_FIU "Build with fault injection support (libfiu)." OFF)
+ option(WITH_CRT "Build with AWS S3 CRT support." OFF)
++option(WITH_EXTERNAL_TABLE_FORMATS "Build the Lance, Iceberg, Paimon and Vortex formats. OFF leaves Parquet only, and removes the Rust TLS stack (rustls, ring, aws-lc-rs, reqwest) and the chacha20 crate from the Rust bridge." ON)
+ option(ARROW_WITH_JEMALLOC "Build with jemalloc." OFF)
+ 
+ if (WITH_CRT)
+@@ -64,7 +65,7 @@ endif()
+ # Rust bridge for Vortex and Lance formats (always built)
+ set(RUST_BRIDGE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src/format/bridge/rust)
+ set(CORROSION_FEATURES "")
+-if (WITH_CRT)
++if (WITH_CRT AND WITH_EXTERNAL_TABLE_FORMATS)
+   list(APPEND CORROSION_FEATURES s3-crt-async)
+ endif()
+ add_subdirectory(${RUST_BRIDGE_PATH})
+@@ -89,8 +90,14 @@ file(GLOB_RECURSE ALL_SRC_FILES
+ )
+ list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/format/bridge/.*\\.(cpp|cc)$")
+ list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/jni/.*\\.cpp$")
++if (NOT WITH_EXTERNAL_TABLE_FORMATS)
++  list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/format/(lance|iceberg|paimon|vortex)/.*\\.(cpp|cc)$")
++endif()
+ 
+ add_library(milvus-storage SHARED ${ALL_SRC_FILES})
++if (NOT WITH_EXTERNAL_TABLE_FORMATS)
++  target_compile_definitions(milvus-storage PUBLIC MILVUS_STORAGE_NO_EXTERNAL_FORMATS)
++endif()
+ 
+ list(APPEND LINK_LIBS
+   arrow::arrow
+@@ -219,7 +226,9 @@ if (WITH_UT)
+ 
+   add_definitions(-DBUILD_GTEST)
+   add_subdirectory(test)
+-  add_subdirectory(tools)
++  if (WITH_EXTERNAL_TABLE_FORMATS)
++    add_subdirectory(tools)
++  endif()
+ endif()
+ 
+ if (WITH_BENCHMARK)
+diff --git a/cpp/Makefile b/cpp/Makefile
+index f42d079..4558e74 100644
+--- a/cpp/Makefile
++++ b/cpp/Makefile
+@@ -14,6 +14,7 @@ use_asan := $(or $(USE_ASAN),True)
+ with_ut := $(or $(WITH_UT),True)
+ with_fiu := $(or $(WITH_FIU),True)
+ with_crt := $(or $(WITH_CRT),False)
++with_external_table_formats := $(or $(WITH_EXTERNAL_TABLE_FORMATS),True)
+ with_benchmark := $(or $(WITH_BENCHMARK),True)
+ build_type := $(or $(BUILD_TYPE),Release)
+ use_jni := $(or $(USE_JNI),False)
+@@ -43,16 +44,17 @@ build:
+ 	@echo "use_python_binding: ${use_python_binding}"
+ 	@echo "with_fiu: ${with_fiu}"
+ 	@echo "with_crt: ${with_crt}"
++	@echo "with_external_table_formats: ${with_external_table_formats}"
+ 
+ 	mkdir -p build && cd build && \
+ 	${CONAN_BASE} \
+ 	-o "&:with_ut=${with_ut}" -o "&:with_benchmark=${with_benchmark}" -o "&:with_asan=${use_asan}" \
+ 	-o "&:with_jni=${use_jni}" -o "&:with_python_binding=${use_python_binding}" -o "&:with_fiu=${with_fiu}" \
+-	-o "&:with_crt=${with_crt}" && \
++	-o "&:with_crt=${with_crt}" -o "&:with_external_table_formats=${with_external_table_formats}" && \
+ 	conan build .. ${CONAN_SETTINGS} \
+ 	-o "&:with_ut=${with_ut}" -o "&:with_benchmark=${with_benchmark}" -o "&:with_asan=${use_asan}" \
+ 	-o "&:with_jni=${use_jni}" -o "&:with_python_binding=${use_python_binding}" -o "&:with_fiu=${with_fiu}" \
+-	-o "&:with_crt=${with_crt}"
++	-o "&:with_crt=${with_crt}" -o "&:with_external_table_formats=${with_external_table_formats}"
+ 
+ package: build
+ 	mkdir -p build && cd build && \
+diff --git a/cpp/conanfile.py b/cpp/conanfile.py
+index 3f59eb8..70e5cf8 100644
+--- a/cpp/conanfile.py
++++ b/cpp/conanfile.py
+@@ -32,6 +32,7 @@ class StorageConan(ConanFile):
+         "with_python_binding": [True, False],
+         "with_fiu": [True, False],
+         "with_crt": [True, False],
++        "with_external_table_formats": [True, False],
+     }
+     default_options = {
+         "shared": True,
+@@ -45,6 +46,7 @@ class StorageConan(ConanFile):
+         "with_python_binding": False,
+         "with_fiu": False,
+         "with_crt": False,
++        "with_external_table_formats": True,
+         "folly/*:shared": True,
+         "glog/*:with_gflags": True,
+         "glog/*:shared": True,
+@@ -256,6 +258,7 @@ class StorageConan(ConanFile):
+         tc.variables["WITH_PYTHON_BINDING"] = self.options.with_python_binding
+         tc.variables["WITH_FIU"] = self.options.with_fiu
+         tc.variables["WITH_CRT"] = self.options.with_crt
++        tc.cache_variables["WITH_EXTERNAL_TABLE_FORMATS"] = self.options.with_external_table_formats
+ 
+         # Set JAVA_HOME for JNI compilation
+         if self.options.with_jni:
+diff --git a/cpp/include/milvus-storage/format/format_reader_cache.h b/cpp/include/milvus-storage/format/format_reader_cache.h
+index a7198fa..7c90676 100644
+--- a/cpp/include/milvus-storage/format/format_reader_cache.h
++++ b/cpp/include/milvus-storage/format/format_reader_cache.h
+@@ -178,6 +178,7 @@ class MetadataCache final {
+     if (format == LOON_FORMAT_PARQUET) {
+       return std::forward<Visitor>(visitor)(get<parquet::ParquetFormatReader>());
+     }
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+     if (format == LOON_FORMAT_VORTEX) {
+       return std::forward<Visitor>(visitor)(get<vortex::VortexFormatReader>());
+     }
+@@ -190,6 +191,7 @@ class MetadataCache final {
+     if (format == LOON_FORMAT_PAIMON_TABLE) {
+       return std::forward<Visitor>(visitor)(get<paimon::PaimonFormatReader>());
+     }
++#endif
+ 
+     return ReturnT(arrow::Status::Invalid("Unknown column group format: ", format));
+   }
+diff --git a/cpp/src/format/bridge/rust/CMakeLists.txt b/cpp/src/format/bridge/rust/CMakeLists.txt
+index e60bf6c..d406a79 100644
+--- a/cpp/src/format/bridge/rust/CMakeLists.txt
++++ b/cpp/src/format/bridge/rust/CMakeLists.txt
+@@ -8,11 +8,26 @@ FetchContent_Declare(
+ )
+ FetchContent_MakeAvailable(Corrosion)
+ 
+-corrosion_import_crate(
+-    MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml
+-    FEATURES ${CORROSION_FEATURES}
+-    CRATES rust-bridge
+-)
++# WITH_EXTERNAL_TABLE_FORMATS=OFF builds the crate without its default
++# `external-table-formats` feature, which also leaves out Vortex. cxxbridge
++# ignores #[cfg(feature)], so the bridge files for the optional parts are only
++# listed when they are compiled.
++if (WITH_EXTERNAL_TABLE_FORMATS)
++    corrosion_import_crate(
++        MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml
++        FEATURES ${CORROSION_FEATURES}
++        CRATES rust-bridge
++    )
++    set(CXXBRIDGE_FILES lib.rs vortex_ffi.rs external_formats_ffi.rs)
++else()
++    corrosion_import_crate(
++        MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml
++        NO_DEFAULT_FEATURES
++        FEATURES ${CORROSION_FEATURES}
++        CRATES rust-bridge
++    )
++    set(CXXBRIDGE_FILES lib.rs)
++endif()
+ 
+ corrosion_set_env_vars(rust_bridge
+     "RUSTFLAGS=-C force-frame-pointers=yes"
+@@ -22,7 +37,7 @@ corrosion_set_env_vars(rust_bridge
+ # otherwise, `rlib` will conflict.
+ corrosion_add_cxxbridge(rust-bridge
+     CRATE rust_bridge
+-    FILES lib.rs)
++    FILES ${CXXBRIDGE_FILES})
+ 
+ target_include_directories(rust-bridge PUBLIC ${Arrow_INCLUDE_DIRS}
+     ${CMAKE_CURRENT_BINARY_DIR}/corrosion_generated/cxxbridge/rust-bridge/include
+@@ -33,6 +48,10 @@ file(GLOB_RECURSE CPP_SOURCE_FILE CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+ )
+ 
++if (NOT WITH_EXTERNAL_TABLE_FORMATS)
++    list(FILTER CPP_SOURCE_FILE EXCLUDE REGEX ".*/src/(lance|iceberg|paimon|vortex)_bridge\\.cpp$")
++endif()
++
+ add_library(prsbridge STATIC ${CPP_SOURCE_FILE})
+ 
+ if (WITH_UT)
+diff --git a/cpp/src/format/bridge/rust/Cargo.toml b/cpp/src/format/bridge/rust/Cargo.toml
+index 4669462..ea13b79 100644
+--- a/cpp/src/format/bridge/rust/Cargo.toml
++++ b/cpp/src/format/bridge/rust/Cargo.toml
+@@ -8,57 +8,80 @@ edition = "2024"
+ crate-type = ["staticlib"]
+ 
+ [features]
++default = ["external-table-formats"]
++# Lance, Iceberg and Paimon, and the cloud credential providers they use. Off
++# removes the Rust TLS stack (rustls, ring, aws-lc-rs, reqwest) from the bridge.
++external-table-formats = [
++    "vortex",
++    "dep:lance", "dep:lance-core", "dep:lance-encoding", "dep:lance-file",
++    "dep:lance-index", "dep:lance-io", "dep:lance-table",
++    "dep:opendal", "dep:object_store_opendal",
++    "dep:iceberg", "dep:iceberg-storage-opendal", "dep:typetag",
++    "dep:aws-config", "dep:aws-credential-types", "dep:object_store",
++    "dep:reqwest", "dep:url", "dep:hmac", "dep:sha1", "dep:base64",
++    "dep:crc32fast", "dep:roaring", "dep:paimon",
++]
++# Vortex, its predicate parser and the C++ filesystem adapter. Its `rand`
++# dependency links the `chacha20` crate.
++vortex = [
++    "dep:vortex", "dep:vortex-btrblocks", "dep:sqlparser",
++    "dep:futures", "dep:lru", "dep:paste", "dep:take_mut", "dep:async-compat",
++    "dep:async-stream", "dep:snafu", "dep:arrow", "dep:arrow-array",
++    "dep:arrow-data", "dep:arrow-schema", "dep:arrow58", "dep:arrow-array58",
++    "dep:arrow-schema58", "dep:bytes", "dep:parquet", "dep:serde",
++    "dep:serde_json", "dep:chrono", "dep:uuid", "dep:async-trait",
++]
+ io-trace = []
+ s3-crt-async = []
+ 
+ [dependencies]
+ # common dependencies
+ anyhow = "1.0.99"
+-futures = "0.3.31"
+-lru = "0.16"
+-paste = "1.0.15"
+-take_mut = "0.2.2"
+-async-compat = "0.2.5"
+-async-stream = "0.3"
++futures = { version = "0.3.31", optional = true }
++lru = { version = "0.16", optional = true }
++paste = { version = "1.0.15", optional = true }
++take_mut = { version = "0.2.2", optional = true }
++async-compat = { version = "0.2.5", optional = true }
++async-stream = { version = "0.3", optional = true }
+ tokio = { version = "1.23", features = ["full"] }
+-snafu = "0.9"
++snafu = { version = "0.9", optional = true }
+ 
+ # Arrow Ecosystem
+-arrow = "56.2.0"
+-arrow-array = {version = "56.2.0", features = ["ffi"]}
+-arrow-data = {version = "56.2.0", features = ["ffi"]}
+-arrow-schema = "56.2.0"
++arrow = { version = "56.2.0", optional = true }
++arrow-array = { optional = true, version = "56.2.0", features = ["ffi"]}
++arrow-data = { optional = true, version = "56.2.0", features = ["ffi"]}
++arrow-schema = { version = "56.2.0", optional = true }
+ 
+ # Lance 7 uses Arrow 58 while Vortex and Iceberg still use Arrow 56. Keep both
+ # versions explicit and bridge them independently through Arrow's C Data API.
+-arrow58 = { package = "arrow", version = "58.0.0" }
+-arrow-array58 = { package = "arrow-array", version = "58.0.0", features = ["ffi"] }
+-arrow-schema58 = { package = "arrow-schema", version = "58.0.0" }
++arrow58 = { optional = true, package = "arrow", version = "58.0.0", features = ["ffi"] }
++arrow-array58 = { optional = true, package = "arrow-array", version = "58.0.0", features = ["ffi"] }
++arrow-schema58 = { optional = true, package = "arrow-schema", version = "58.0.0" }
+ 
+ # Vortex Ecosystem
+-vortex = { git = "https://github.com/zilliztech/vortex", rev = "088063f0fdf2dd9e6a3db7ed4bb8137e18ca5ee3", features = ["tokio"] }
+-vortex-btrblocks = { git = "https://github.com/zilliztech/vortex", rev = "088063f0fdf2dd9e6a3db7ed4bb8137e18ca5ee3" }
++vortex = { optional = true, git = "https://github.com/zilliztech/vortex", rev = "088063f0fdf2dd9e6a3db7ed4bb8137e18ca5ee3", features = ["tokio"] }
++vortex-btrblocks = { optional = true, git = "https://github.com/zilliztech/vortex", rev = "088063f0fdf2dd9e6a3db7ed4bb8137e18ca5ee3" }
+ 
+ # Lance Ecosystem
+-lance = { version = "=7.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss"] }
+-lance-core = "=7.0.0"
+-lance-encoding = "=7.0.0"
+-lance-file = "=7.0.0"
+-lance-index = "=7.0.0"
++lance = { optional = true, version = "=7.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss"] }
++lance-core = { version = "=7.0.0", optional = true }
++lance-encoding = { version = "=7.0.0", optional = true }
++lance-file = { version = "=7.0.0", optional = true }
++lance-index = { version = "=7.0.0", optional = true }
+ # `oss` feature activates lance-io's stock OssStoreProvider (registered against
+ # the `oss://` scheme) plus `opendal/services-oss`. Our AliyunOssStoreProvider
+ # overrides stock only when per-tenant `oss_role_arn` is present; single-tenant
+ # env-driven OSS continues to go through stock.
+-lance-io = { version = "=7.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss"] }
+-lance-table = "=7.0.0"
++lance-io = { optional = true, version = "=7.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss"] }
++lance-table = { version = "=7.0.0", optional = true }
+ 
+ # OSS backend for the AliyunOssStoreProvider in src/aliyun_oss_provider.rs.
+ # Match the opendal version used by lance-io 7.0.0 so this provider does not
+ # add another copy beyond Lance's 0.56 and Iceberg's existing 0.55. `services-oss`
+ # is the only service this module uses; this project handles the two-step Aliyun
+ # role_arn credential flow before handing static STS creds to opendal.
+-opendal = { version = "0.56", features = ["services-oss"] }
+-object_store_opendal = "0.56"
++opendal = { optional = true, version = "0.56", features = ["services-oss"] }
++object_store_opendal = { version = "0.56", optional = true }
+ 
+ # Iceberg Ecosystem
+ # iceberg 0.9 moved the opendal-backed storage implementations (s3/gcs/azdls/oss)
+@@ -67,50 +90,50 @@ object_store_opendal = "0.56"
+ # `AliyunOssStorageFactory` in aliyun_oss_provider.rs so we can forward per-tenant
+ # role_arn (OIDC) + the ECS-IMDS RAM flow, neither of which upstream's `OssConfig`
+ # supports (it only accepts endpoint/AK/SK).
+-bytes = "1"
+-iceberg = "0.9"
+-iceberg-storage-opendal = { version = "0.9", features = ["opendal-s3", "opendal-gcs", "opendal-azdls"] }
++bytes = { version = "1", optional = true }
++iceberg = { version = "0.9", optional = true }
++iceberg-storage-opendal = { optional = true, version = "0.9", features = ["opendal-s3", "opendal-gcs", "opendal-azdls"] }
+ # Required for #[typetag::serde] on our custom Storage/StorageFactory impls that
+ # plug into iceberg's FileIO pipeline. Pinned to match iceberg-storage-opendal's
+ # own typetag dep so we don't end up with two typetag copies.
+-typetag = "0.2"
+-parquet = { version = "56.2.0", features = ["arrow"] }
+-serde = { version = "1", features = ["derive"] }
+-serde_json = "1"
+-chrono = "0.4"
+-uuid = { version = "1", features = ["v7"] }
++typetag = { version = "0.2", optional = true }
++parquet = { optional = true, version = "56.2.0", features = ["arrow"] }
++serde = { optional = true, version = "1", features = ["derive"] }
++serde_json = { version = "1", optional = true }
++chrono = { version = "0.4", optional = true }
++uuid = { optional = true, version = "1", features = ["v7"] }
+ 
+ # AWS SDK (for Lance AssumeRole credential provider)
+-aws-config = "1"
+-aws-credential-types = "1"
+-object_store = { version = "0.13", features = ["aws", "gcp"] }
++aws-config = { version = "1", optional = true }
++aws-credential-types = { version = "1", optional = true }
++object_store = { optional = true, version = "0.13", features = ["aws", "gcp"] }
+ 
+ # HTTP client for the GCP Service Account Impersonation flow in
+ # gcp_impersonation.rs (calls metadata.google.internal + iamcredentials.googleapis.com).
+ # Already in the transitive tree via lance-io / iceberg / reqsign; pinned here
+ # to match those (0.12.x) and to opt into rustls (the workspace TLS choice).
+-async-trait = "0.1"
+-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
++async-trait = { version = "0.1", optional = true }
++reqwest = { optional = true, version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ # `url::Url` is named in lance-io's ObjectStoreProvider::new_store signature
+ # we implement; keep as a direct dep rather than leaning on transitive re-export.
+-url = "2"
++url = { version = "2", optional = true }
+ 
+ # Crypto + encoding for Aliyun POP v1 signing in aliyun_oss_provider.rs
+ # (ECS IMDS → sts:AssumeRole fallback when OIDC machine identity is absent).
+ # All three are already in the transitive graph via reqsign / aws SDKs;
+ # pin versions to match so we don't add duplicate copies.
+-hmac = "0.12"
+-sha1 = "0.10"
+-base64 = "0.22"
+-crc32fast = "1"
+-roaring = "0.11"
++hmac = { version = "0.12", optional = true }
++sha1 = { version = "0.10", optional = true }
++base64 = { version = "0.22", optional = true }
++crc32fast = { version = "1", optional = true }
++roaring = { version = "0.11", optional = true }
+ 
+ # Apache Paimon planner and test writer. Keep the exact release and Cargo.lock
+ # together. Paimon uses the Arrow 58 already present for Lance.
+-paimon = { version = "=0.3.0", default-features = false, features = ["storage-fs", "storage-s3", "storage-oss", "storage-azdls", "storage-gcs", "vortex"] }
++paimon = { optional = true, version = "=0.3.0", default-features = false, features = ["storage-fs", "storage-s3", "storage-oss", "storage-azdls", "storage-gcs", "vortex"] }
+ 
+ # SQL predicate parsing
+-sqlparser = "0.55"
++sqlparser = { version = "0.55", optional = true }
+ 
+ # CXX bridge
+ cxx = "1.0.184"
+diff --git a/cpp/src/format/bridge/rust/include/lance_bridge.h b/cpp/src/format/bridge/rust/include/lance_bridge.h
+index 6504ef0..8b3198e 100644
+--- a/cpp/src/format/bridge/rust/include/lance_bridge.h
++++ b/cpp/src/format/bridge/rust/include/lance_bridge.h
+@@ -23,7 +23,7 @@
+ #include <arrow/result.h>
+ 
+ #include "rust/cxx.h"
+-#include "rust-bridge/lib.h"
++#include "rust-bridge/external_formats_ffi.h"
+ 
+ namespace milvus_storage::lance {
+ 
+diff --git a/cpp/src/format/bridge/rust/include/paimon_bridge.h b/cpp/src/format/bridge/rust/include/paimon_bridge.h
+index 4874914..6fc0594 100644
+--- a/cpp/src/format/bridge/rust/include/paimon_bridge.h
++++ b/cpp/src/format/bridge/rust/include/paimon_bridge.h
+@@ -23,7 +23,7 @@
+ 
+ #include <arrow/result.h>
+ #include "rust/cxx.h"
+-#include "rust-bridge/lib.h"
++#include "rust-bridge/external_formats_ffi.h"
+ 
+ namespace arrow {
+ class RecordBatchReader;
+diff --git a/cpp/src/format/bridge/rust/include/vortex_bridge.h b/cpp/src/format/bridge/rust/include/vortex_bridge.h
+index 752b826..4cf3601 100644
+--- a/cpp/src/format/bridge/rust/include/vortex_bridge.h
++++ b/cpp/src/format/bridge/rust/include/vortex_bridge.h
+@@ -15,7 +15,7 @@
+ #include <arrow/status.h>
+ 
+ #include "rust/cxx.h"
+-#include "rust-bridge/lib.h"
++#include "rust-bridge/vortex_ffi.h"
+ 
+ namespace arrow {
+ class RecordBatchReader;
+diff --git a/cpp/src/format/bridge/rust/src/external_formats_ffi.rs b/cpp/src/format/bridge/rust/src/external_formats_ffi.rs
+new file mode 100644
+index 0000000..6b76068
+--- /dev/null
++++ b/cpp/src/format/bridge/rust/src/external_formats_ffi.rs
+@@ -0,0 +1,305 @@
++// Copyright 2023 Zilliz
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Lance, Paimon and Iceberg cxx bridges. They live apart from lib.rs because
++// cxxbridge drops #[cfg(feature)] blocks unless --cfg is passed, which Corrosion
++// does not do. CMake lists this file only when the formats are enabled.
++
++use crate::iceberg_bridgeimpl::*;
++use crate::iceberg_testutil::*;
++use crate::lance_bridgeimpl::*;
++use crate::paimon_bridgeimpl::*;
++use crate::paimon_testutil::*;
++
++#[cxx::bridge(namespace = "milvus_storage::lance::ffi")]
++pub mod lance_ffi {
++    /// Lance data storage format
++    #[repr(u8)]
++    #[derive(Debug, Clone, Copy)]
++    enum LanceDataStorageFormat {
++        Legacy = 0,
++        V2_1 = 1,
++        V2_2 = 2,
++        V2_3 = 3,
++    }
++
++    /// Test-only Lance IO statistics with read-and-reset semantics.
++    struct LanceIOStats {
++        read_iops: u64,
++        read_bytes: u64,
++    }
++
++    struct LanceColumnMemoryEstimate {
++        field_id: i32,
++        memory_size: u64,
++    }
++
++    extern "Rust" {
++
++        type BlockingDataset;
++        /// Test instrumentation for the ObjectStore retained by this dataset.
++        ///
++        /// When datasets share a ScanScheduler, scheduled reads are tracked by the
++        /// ObjectStore captured from the dataset that created that scheduler. This
++        /// method therefore must not be interpreted as per-dataset accounting.
++        pub fn io_stats_incremental(self: &BlockingDataset) -> LanceIOStats;
++        /// Open the latest Dataset when version is zero, or the exact snapshot
++        /// identified by a non-zero version.
++        pub fn open_dataset(
++            uri: &str,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++            version: u64,
++        ) -> Result<Box<BlockingDataset>>;
++        /// Resolve only the latest manifest location and return its version.
++        /// This does not load or decode the manifest, construct a Dataset, or
++        /// initialize a ScanScheduler.
++        pub fn resolve_latest_dataset_version(
++            uri: &str,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++        ) -> Result<u64>;
++        pub unsafe fn write_dataset(
++            uri: &str,
++            stream_ptr: *mut u8,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++            data_storage_format: LanceDataStorageFormat,
++            enable_stable_row_ids: bool,
++        ) -> Result<Box<BlockingDataset>>;
++
++        pub unsafe fn write_stream(self: &mut BlockingDataset, stream_ptr: *mut u8) -> Result<()>;
++        pub fn version(self: &BlockingDataset) -> u64;
++        pub fn get_all_fragment_ids(self: &BlockingDataset) -> Vec<u64>;
++        pub fn dataset_delete_rows(dataset: &mut BlockingDataset, predicate: &str) -> Result<()>;
++        pub fn get_fragment_deletion_positions(
++            dataset: &BlockingDataset,
++            fragment_id: u64,
++        ) -> Result<Vec<u64>>;
++        pub fn get_fragment_physical_row_count(
++            dataset: &BlockingDataset,
++            fragment_id: u64,
++        ) -> Result<u64>;
++        pub fn get_fragment_row_count(dataset: &BlockingDataset, fragment_id: u64) -> Result<u64>;
++        type FragmentFilesMetadata;
++        pub fn externalize_row_ids_for_testing(uri: &str) -> Result<()>;
++        pub unsafe fn get_fragment_schema(
++            dataset: &BlockingDataset,
++            fragment_id: u64,
++            out_schema_ptr: *mut u8,
++        ) -> Result<()>;
++
++        type BlockingFragmentReader;
++        pub unsafe fn open_fragment_reader(
++            dataset: &BlockingDataset,
++            fragment_id: u64,
++            schema_rawptr: *mut u8,
++            metadata: *const FragmentFilesMetadata,
++        ) -> Result<Box<BlockingFragmentReader>>;
++
++        pub fn get_files_metadata(self: &BlockingFragmentReader) -> Box<FragmentFilesMetadata>;
++        pub fn estimate_fragment_column_memory(
++            self: &BlockingFragmentReader,
++        ) -> Result<Vec<LanceColumnMemoryEstimate>>;
++        pub fn estimate_fragment_memory(self: &BlockingFragmentReader) -> Result<u64>;
++
++        // BlockingFragmentReader functions
++        pub fn number_of_rows(self: &BlockingFragmentReader) -> Result<u64>;
++        pub unsafe fn take_as_single_batch(
++            self: &BlockingFragmentReader,
++            indices: &[u32],
++            out_array: *mut u8,
++        ) -> Result<()>;
++
++        pub unsafe fn take_as_stream(
++            self: &BlockingFragmentReader,
++            indices: &[u32],
++            batch_size: u32,
++            out_stream: *mut u8,
++        ) -> Result<()>;
++
++        pub unsafe fn read_all_as_stream(
++            self: &BlockingFragmentReader,
++            batch_size: u32,
++            out_stream: *mut u8,
++        ) -> Result<()>;
++
++        pub unsafe fn read_ranges_as_stream(
++            self: &BlockingFragmentReader,
++            row_range_start: u32,
++            row_range_end: u32,
++            batch_size: u32,
++            out_stream: *mut u8,
++        ) -> Result<()>;
++
++        // BlockingScanner: dataset-level scan
++        type BlockingScanner;
++        pub unsafe fn create_scanner(
++            dataset: &BlockingDataset,
++            schema_ptr: *mut u8,
++            batch_size: u32,
++        ) -> Result<Box<BlockingScanner>>;
++
++        pub fn count_rows(self: &BlockingScanner) -> Result<u64>;
++
++        pub unsafe fn open_stream(self: &BlockingScanner, out_stream: *mut u8) -> Result<()>;
++
++        // Dataset-level take
++        pub unsafe fn dataset_take(
++            dataset: &BlockingDataset,
++            indices: &[u64],
++            schema_ptr: *mut u8,
++            out_stream: *mut u8,
++        ) -> Result<()>;
++
++    }
++} // mod lance_ffi
++
++#[cxx::bridge(namespace = "milvus_storage::paimon::ffi")]
++pub mod paimon_ffi {
++    /// A single physical file or atomic DataSplit returned by Paimon planning.
++    struct PaimonFileInfo {
++        path: String,
++        file_size: u64,
++        metadata_json: String,
++    }
++
++    extern "Rust" {
++        type BlockingPaimonDataSplitReader;
++
++        fn paimon_plan_files(
++            table_location: &str,
++            snapshot_id: i64,
++            scan_mode: &str,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++        ) -> Result<Vec<PaimonFileInfo>>;
++
++        fn paimon_read_deletion_vector(
++            path: &str,
++            offset: u64,
++            length: u64,
++            expected_cardinality: i64,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++        ) -> Result<Vec<u64>>;
++
++        fn paimon_open_data_split_reader(
++            metadata_json: &str,
++            expected_table_location: &str,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++        ) -> Result<Box<BlockingPaimonDataSplitReader>>;
++
++        unsafe fn export_schema(
++            self: &BlockingPaimonDataSplitReader,
++            out_schema_ptr: *mut u8,
++        ) -> Result<()>;
++
++        unsafe fn open_stream(
++            self: &BlockingPaimonDataSplitReader,
++            projected_columns: Vec<String>,
++            out_stream_ptr: *mut u8,
++        ) -> Result<()>;
++    }
++}
++
++#[cxx::bridge(namespace = "milvus_storage::paimon::ffi")]
++pub mod paimon_test_ffi {
++    struct PaimonTestTableInfo {
++        snapshot_ids: Vec<i64>,
++    }
++
++    extern "Rust" {
++        /// Create a repository-owned local Paimon fixture through the public
++        /// paimon-rust writer/commit APIs.
++        fn paimon_create_test_table(
++            table_location: &str,
++            num_rows: u64,
++            mode: &str,
++            deleted_positions: Vec<i64>,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++            file_format: &str,
++            dimension: u32,
++        ) -> Result<PaimonTestTableInfo>;
++    }
++}
++
++#[cxx::bridge(namespace = "milvus_storage::iceberg::ffi")]
++pub mod iceberg_ffi {
++    /// Per-file info returned from plan_files.
++    struct IcebergFileInfo {
++        /// Absolute data file URI from Iceberg metadata
++        data_file_path: String,
++        /// Physical row count (before deletes)
++        record_count: u64,
++        /// Number of rows deleted from this data file
++        num_deleted_rows: u64,
++        /// JSON-serialized delete file references.
++        /// Empty Vec when no deletes apply to this file.
++        delete_metadata_json: Vec<u8>,
++    }
++
++    extern "Rust" {
++        /// Plan files for a given Iceberg table + snapshot.
++        /// Returns one IcebergFileInfo per data file.
++        ///
++        /// Uses iceberg-rust's TableScan::plan_files() internally
++        /// which handles snapshot resolution, delete file association,
++        /// sequence number filtering, and partition matching.
++        fn iceberg_plan_files(
++            metadata_location: &str,
++            snapshot_id: i64,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++        ) -> Result<Vec<IcebergFileInfo>>;
++    }
++}
++
++#[cxx::bridge(namespace = "milvus_storage::iceberg::ffi")]
++pub mod iceberg_test_ffi {
++    /// Info returned after creating a test Iceberg table.
++    struct IcebergTestTableInfo {
++        /// Path to the metadata.json file
++        metadata_location: String,
++        /// Snapshot ID of the created snapshot
++        snapshot_id: i64,
++        /// URI of the data file written
++        data_file_uri: String,
++    }
++
++    extern "Rust" {
++        /// Create a test Iceberg table on local filesystem or cloud storage.
++        ///
++        /// Schema: id (int64), name (string), value (float64)
++        /// Data: id=0..N-1, name="row_0".."row_{N-1}", value=i*1.5
++        ///
++        /// For cloud storage, pass storage options (e.g., s3.access-key-id, s3.region).
++        /// For local filesystem, pass empty storage options.
++        fn iceberg_create_test_table(
++            table_dir: &str,
++            num_rows: u64,
++            with_positional_deletes: bool,
++            deleted_positions: Vec<i64>,
++            storage_options_keys: Vec<String>,
++            storage_options_values: Vec<String>,
++            // Empty string = no override. Set e.g. to "gs" when physically
++            // writing via "s3://" S3-compat to GCS but intending to read via
++            // native "gs://" — iceberg-rust otherwise bakes the write-time
++            // scheme into every level of metadata and never swaps it on read.
++            record_scheme_override: &str,
++        ) -> Result<IcebergTestTableInfo>;
++    }
++}
+diff --git a/cpp/src/format/bridge/rust/src/iceberg_bridge.cpp b/cpp/src/format/bridge/rust/src/iceberg_bridge.cpp
+index 0a3b0f9..1ed74b6 100644
+--- a/cpp/src/format/bridge/rust/src/iceberg_bridge.cpp
++++ b/cpp/src/format/bridge/rust/src/iceberg_bridge.cpp
+@@ -16,7 +16,7 @@
+ #include "bridge_util.h"
+ 
+ #include "rust/cxx.h"
+-#include "rust-bridge/lib.h"
++#include "rust-bridge/external_formats_ffi.h"
+ 
+ namespace milvus_storage::iceberg {
+ 
+diff --git a/cpp/src/format/bridge/rust/src/lib.rs b/cpp/src/format/bridge/rust/src/lib.rs
+index b0e97e6..7c95134 100644
+--- a/cpp/src/format/bridge/rust/src/lib.rs
++++ b/cpp/src/format/bridge/rust/src/lib.rs
+@@ -12,53 +12,87 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// Optional parts of the bridge:
++// - `external-table-formats`: Lance, Iceberg and Paimon, and the cloud
++//   credential providers only they use (AWS AssumeRole, Azure SAS broker, GCP
++//   impersonation, Aliyun OSS). These bring the Rust TLS stack (rustls, ring,
++//   aws-lc-rs, reqwest).
++// - `vortex`: the Vortex format and the C++ filesystem adapter it reads
++//   through. Implied by `external-table-formats`.
++// With neither, the bridge keeps only the shared Tokio runtime.
++#![cfg_attr(not(feature = "vortex"), allow(dead_code, unused_imports))]
++
++#[cfg(feature = "external-table-formats")]
+ mod aliyun_oss_provider;
++#[cfg(feature = "external-table-formats")]
+ mod aws_arn_provider;
++#[cfg(feature = "external-table-formats")]
+ mod azure_sas_provider;
++#[cfg(feature = "external-table-formats")]
+ mod cloud_provider_cache;
++#[cfg(feature = "external-table-formats")]
+ mod gcp_impersonation;
++#[cfg(feature = "external-table-formats")]
+ mod iceberg_bridgeimpl;
++#[cfg(feature = "external-table-formats")]
+ mod iceberg_testutil;
++#[cfg(feature = "external-table-formats")]
+ mod lance_bridgeimpl;
++#[cfg(feature = "external-table-formats")]
+ mod lance_memory_estimator;
++#[cfg(feature = "external-table-formats")]
+ mod paimon_bridgeimpl;
++#[cfg(feature = "external-table-formats")]
+ mod paimon_split_serde;
++#[cfg(feature = "external-table-formats")]
+ mod paimon_testutil;
++#[cfg(feature = "vortex")]
+ mod predicate_parser;
+ mod rust_runtime;
++#[cfg(feature = "vortex")]
++#[path = "vortex_ffi.rs"]
++mod vortex_bridge_ffi;
++#[cfg(feature = "vortex")]
+ mod vortex_bridgeimpl;
++#[cfg(feature = "vortex")]
+ mod vortex_layout_strategy_v2;
+-
++#[cfg(feature = "vortex")]
++pub use vortex_bridge_ffi::vortex_ffi;
++#[cfg(feature = "external-table-formats")]
++mod external_formats_ffi;
++#[cfg(feature = "external-table-formats")]
++pub use external_formats_ffi::{
++    iceberg_ffi, iceberg_test_ffi, lance_ffi, paimon_ffi, paimon_test_ffi,
++};
++
++#[cfg(feature = "vortex")]
+ mod filesystem_c;
+-use iceberg_bridgeimpl::*;
+-use iceberg_testutil::*;
+-use lance_bridgeimpl::*;
+-use paimon_bridgeimpl::*;
+-use paimon_testutil::*;
+ use rust_runtime::configure_rust_runtime;
+-use vortex_bridgeimpl::*;
+ 
++pub(crate) use rust_runtime::TOKIO_RT;
++
++#[cfg(feature = "vortex")]
+ use std::sync::LazyLock;
+ 
+-use vortex::VortexSessionDefault;
+-use vortex::io::runtime::BlockingRuntime;
+-use vortex::io::runtime::tokio::TokioRuntime;
+-use vortex::io::session::RuntimeSessionExt;
+-use vortex::layout::LayoutEncodingRef;
+-use vortex::layout::session::LayoutSessionExt;
+-use vortex::session::VortexSession;
++#[cfg(feature = "vortex")]
++use vortex::{
++    VortexSessionDefault, io::runtime::BlockingRuntime, io::runtime::tokio::TokioRuntime,
++    io::session::RuntimeSessionExt, layout::LayoutEncodingRef, layout::session::LayoutSessionExt,
++    session::VortexSession,
++};
+ 
++#[cfg(feature = "vortex")]
+ use crate::vortex_layout_strategy_v2::RowGroupZoneMapLayoutEncoding;
+ 
+-pub(crate) use rust_runtime::TOKIO_RT;
+-
+ /// Vortex runtime adapter backed by the shared Tokio runtime.
+ ///
+ /// This is not a second Tokio runtime; it only gives Vortex APIs a
+ /// `BlockingRuntime` view over `TOKIO_RT`.
++#[cfg(feature = "vortex")]
+ static VORTEX_RT: LazyLock<TokioRuntime> =
+     LazyLock::new(|| TokioRuntime::new(TOKIO_RT.handle().clone()));
+ 
++#[cfg(feature = "vortex")]
+ static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+     let session = VortexSession::default().with_handle(VORTEX_RT.handle());
+     session.layouts().register(LayoutEncodingRef::new_ref(
+@@ -73,459 +107,3 @@ pub mod rust_runtime_ffi {
+         fn configure_rust_runtime(worker_threads: u32, max_blocking_threads: u32) -> Result<()>;
+     }
+ }
+-
+-#[cxx::bridge(namespace = "milvus_storage::lance::ffi")]
+-pub mod lance_ffi {
+-    /// Lance data storage format
+-    #[repr(u8)]
+-    #[derive(Debug, Clone, Copy)]
+-    enum LanceDataStorageFormat {
+-        Legacy = 0,
+-        V2_1 = 1,
+-        V2_2 = 2,
+-        V2_3 = 3,
+-    }
+-
+-    /// Test-only Lance IO statistics with read-and-reset semantics.
+-    struct LanceIOStats {
+-        read_iops: u64,
+-        read_bytes: u64,
+-    }
+-
+-    struct LanceColumnMemoryEstimate {
+-        field_id: i32,
+-        memory_size: u64,
+-    }
+-
+-    extern "Rust" {
+-
+-        type BlockingDataset;
+-        /// Test instrumentation for the ObjectStore retained by this dataset.
+-        ///
+-        /// When datasets share a ScanScheduler, scheduled reads are tracked by the
+-        /// ObjectStore captured from the dataset that created that scheduler. This
+-        /// method therefore must not be interpreted as per-dataset accounting.
+-        pub fn io_stats_incremental(self: &BlockingDataset) -> LanceIOStats;
+-        /// Open the latest Dataset when version is zero, or the exact snapshot
+-        /// identified by a non-zero version.
+-        pub fn open_dataset(
+-            uri: &str,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-            version: u64,
+-        ) -> Result<Box<BlockingDataset>>;
+-        /// Resolve only the latest manifest location and return its version.
+-        /// This does not load or decode the manifest, construct a Dataset, or
+-        /// initialize a ScanScheduler.
+-        pub fn resolve_latest_dataset_version(
+-            uri: &str,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-        ) -> Result<u64>;
+-        pub unsafe fn write_dataset(
+-            uri: &str,
+-            stream_ptr: *mut u8,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-            data_storage_format: LanceDataStorageFormat,
+-            enable_stable_row_ids: bool,
+-        ) -> Result<Box<BlockingDataset>>;
+-
+-        pub unsafe fn write_stream(self: &mut BlockingDataset, stream_ptr: *mut u8) -> Result<()>;
+-        pub fn version(self: &BlockingDataset) -> u64;
+-        pub fn get_all_fragment_ids(self: &BlockingDataset) -> Vec<u64>;
+-        pub fn dataset_delete_rows(dataset: &mut BlockingDataset, predicate: &str) -> Result<()>;
+-        pub fn get_fragment_deletion_positions(
+-            dataset: &BlockingDataset,
+-            fragment_id: u64,
+-        ) -> Result<Vec<u64>>;
+-        pub fn get_fragment_physical_row_count(
+-            dataset: &BlockingDataset,
+-            fragment_id: u64,
+-        ) -> Result<u64>;
+-        pub fn get_fragment_row_count(dataset: &BlockingDataset, fragment_id: u64) -> Result<u64>;
+-        type FragmentFilesMetadata;
+-        pub fn externalize_row_ids_for_testing(uri: &str) -> Result<()>;
+-        pub unsafe fn get_fragment_schema(
+-            dataset: &BlockingDataset,
+-            fragment_id: u64,
+-            out_schema_ptr: *mut u8,
+-        ) -> Result<()>;
+-
+-        type BlockingFragmentReader;
+-        pub unsafe fn open_fragment_reader(
+-            dataset: &BlockingDataset,
+-            fragment_id: u64,
+-            schema_rawptr: *mut u8,
+-            metadata: *const FragmentFilesMetadata,
+-        ) -> Result<Box<BlockingFragmentReader>>;
+-
+-        pub fn get_files_metadata(self: &BlockingFragmentReader) -> Box<FragmentFilesMetadata>;
+-        pub fn estimate_fragment_column_memory(
+-            self: &BlockingFragmentReader,
+-        ) -> Result<Vec<LanceColumnMemoryEstimate>>;
+-        pub fn estimate_fragment_memory(self: &BlockingFragmentReader) -> Result<u64>;
+-
+-        // BlockingFragmentReader functions
+-        pub fn number_of_rows(self: &BlockingFragmentReader) -> Result<u64>;
+-        pub unsafe fn take_as_single_batch(
+-            self: &BlockingFragmentReader,
+-            indices: &[u32],
+-            out_array: *mut u8,
+-        ) -> Result<()>;
+-
+-        pub unsafe fn take_as_stream(
+-            self: &BlockingFragmentReader,
+-            indices: &[u32],
+-            batch_size: u32,
+-            out_stream: *mut u8,
+-        ) -> Result<()>;
+-
+-        pub unsafe fn read_all_as_stream(
+-            self: &BlockingFragmentReader,
+-            batch_size: u32,
+-            out_stream: *mut u8,
+-        ) -> Result<()>;
+-
+-        pub unsafe fn read_ranges_as_stream(
+-            self: &BlockingFragmentReader,
+-            row_range_start: u32,
+-            row_range_end: u32,
+-            batch_size: u32,
+-            out_stream: *mut u8,
+-        ) -> Result<()>;
+-
+-        // BlockingScanner: dataset-level scan
+-        type BlockingScanner;
+-        pub unsafe fn create_scanner(
+-            dataset: &BlockingDataset,
+-            schema_ptr: *mut u8,
+-            batch_size: u32,
+-        ) -> Result<Box<BlockingScanner>>;
+-
+-        pub fn count_rows(self: &BlockingScanner) -> Result<u64>;
+-
+-        pub unsafe fn open_stream(self: &BlockingScanner, out_stream: *mut u8) -> Result<()>;
+-
+-        // Dataset-level take
+-        pub unsafe fn dataset_take(
+-            dataset: &BlockingDataset,
+-            indices: &[u64],
+-            schema_ptr: *mut u8,
+-            out_stream: *mut u8,
+-        ) -> Result<()>;
+-
+-    }
+-} // mod lance_ffi
+-
+-#[cxx::bridge(namespace = "milvus_storage::paimon::ffi")]
+-pub mod paimon_ffi {
+-    /// A single physical file or atomic DataSplit returned by Paimon planning.
+-    struct PaimonFileInfo {
+-        path: String,
+-        file_size: u64,
+-        metadata_json: String,
+-    }
+-
+-    extern "Rust" {
+-        type BlockingPaimonDataSplitReader;
+-
+-        fn paimon_plan_files(
+-            table_location: &str,
+-            snapshot_id: i64,
+-            scan_mode: &str,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-        ) -> Result<Vec<PaimonFileInfo>>;
+-
+-        fn paimon_read_deletion_vector(
+-            path: &str,
+-            offset: u64,
+-            length: u64,
+-            expected_cardinality: i64,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-        ) -> Result<Vec<u64>>;
+-
+-        fn paimon_open_data_split_reader(
+-            metadata_json: &str,
+-            expected_table_location: &str,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-        ) -> Result<Box<BlockingPaimonDataSplitReader>>;
+-
+-        unsafe fn export_schema(
+-            self: &BlockingPaimonDataSplitReader,
+-            out_schema_ptr: *mut u8,
+-        ) -> Result<()>;
+-
+-        unsafe fn open_stream(
+-            self: &BlockingPaimonDataSplitReader,
+-            projected_columns: Vec<String>,
+-            out_stream_ptr: *mut u8,
+-        ) -> Result<()>;
+-    }
+-}
+-
+-#[cxx::bridge(namespace = "milvus_storage::paimon::ffi")]
+-pub mod paimon_test_ffi {
+-    struct PaimonTestTableInfo {
+-        snapshot_ids: Vec<i64>,
+-    }
+-
+-    extern "Rust" {
+-        /// Create a repository-owned local Paimon fixture through the public
+-        /// paimon-rust writer/commit APIs.
+-        fn paimon_create_test_table(
+-            table_location: &str,
+-            num_rows: u64,
+-            mode: &str,
+-            deleted_positions: Vec<i64>,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-            file_format: &str,
+-            dimension: u32,
+-        ) -> Result<PaimonTestTableInfo>;
+-    }
+-}
+-
+-#[cxx::bridge(namespace = "milvus_storage::vortex::ffi")]
+-pub mod vortex_ffi {
+-    struct VortexWriteSummary {
+-        file_size: u64,
+-        footer_size: u64,
+-    }
+-
+-    struct CoalescingWindow {
+-        distance: u64,
+-        max_size: u64,
+-    }
+-
+-    struct RowGroupZoneMapPruningStats {
+-        prune_eval_count: u64,
+-        pruned_row_group_count: u64,
+-    }
+-
+-    extern "Rust" {
+-        type DType;
+-        // Factory functions for creating DType
+-        fn dtype_null() -> Box<DType>;
+-        fn dtype_bool(nullable: bool) -> Box<DType>;
+-        fn dtype_primitive(ptype: PType, nullable: bool) -> Box<DType>;
+-        fn dtype_decimal(precision: u8, scale: i8, nullable: bool) -> Box<DType>;
+-        fn dtype_utf8(nullable: bool) -> Box<DType>;
+-        fn dtype_binary(nullable: bool) -> Box<DType>;
+-        unsafe fn from_arrow(ffi_schema: *mut u8, non_nullable: bool) -> Result<Box<DType>>;
+-        // Methods for DType
+-        fn to_string(self: &DType) -> String;
+-
+-        type Scalar;
+-        fn bool_scalar_new(value: bool) -> Box<Scalar>;
+-        fn i8_scalar_new(value: i8) -> Box<Scalar>;
+-        fn i16_scalar_new(value: i16) -> Box<Scalar>;
+-        fn i32_scalar_new(value: i32) -> Box<Scalar>;
+-        fn i64_scalar_new(value: i64) -> Box<Scalar>;
+-        fn u8_scalar_new(value: u8) -> Box<Scalar>;
+-        fn u16_scalar_new(value: u16) -> Box<Scalar>;
+-        fn u32_scalar_new(value: u32) -> Box<Scalar>;
+-        fn u64_scalar_new(value: u64) -> Box<Scalar>;
+-        fn f32_scalar_new(value: f32) -> Box<Scalar>;
+-        fn f64_scalar_new(value: f64) -> Box<Scalar>;
+-        fn string_scalar_new(value: &str) -> Box<Scalar>;
+-        fn binary_scalar_new(value: &[u8]) -> Box<Scalar>;
+-        fn cast_scalar(self: &Scalar, dtype: &DType) -> Result<Box<Scalar>>;
+-
+-        type Expr;
+-        fn literal(scalar: Box<Scalar>) -> Box<Expr>;
+-        fn root() -> Box<Expr>;
+-        fn column(name: String) -> Box<Expr>;
+-        fn get_item(field: String, child: Box<Expr>) -> Box<Expr>;
+-        fn not_(child: Box<Expr>) -> Box<Expr>;
+-        fn is_null(child: Box<Expr>) -> Box<Expr>;
+-        // binary op
+-        fn eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn not_eq_(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn gt(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn gt_eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn lt(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn lt_eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn and_(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn or_(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn checked_add(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
+-        fn select(fields: Vec<String>, child: Box<Expr>) -> Box<Expr>;
+-
+-        type ParsedPredicate;
+-        fn parse_predicate_string(
+-            predicate: &str,
+-            column_names: Vec<String>,
+-            column_type_tags: Vec<u8>,
+-        ) -> Result<Box<ParsedPredicate>>;
+-        fn has_filter(self: &ParsedPredicate) -> bool;
+-        fn take_filter(self: &mut ParsedPredicate) -> Box<Expr>;
+-
+-        // writer
+-        type VortexWriter;
+-        unsafe fn open_writer(
+-            fswrapper_ptr: *mut u8,
+-            path: &str,
+-            enable_stats: bool,
+-            format_version: u32,
+-            row_group_size: u64,
+-        ) -> Result<Box<VortexWriter>>;
+-        unsafe fn write(
+-            self: &mut VortexWriter,
+-            in_schema: *mut u8,
+-            in_array: *mut u8,
+-        ) -> Result<()>;
+-        unsafe fn flush(self: &mut VortexWriter) -> Result<()>;
+-        unsafe fn close(self: &mut VortexWriter) -> Result<VortexWriteSummary>;
+-
+-        // reader
+-        type VortexFile;
+-        fn row_count(self: &VortexFile) -> u64;
+-        unsafe fn get_schema(self: &VortexFile, out_schema: *mut u8) -> Result<()>;
+-        fn scan_builder(
+-            self: &VortexFile,
+-            window: CoalescingWindow,
+-        ) -> Result<Box<VortexScanBuilder>>;
+-        unsafe fn scan_builder_with_schema(
+-            self: &VortexFile,
+-            in_schema: *mut u8,
+-        ) -> Result<Box<VortexScanBuilder>>;
+-        fn splits(self: &VortexFile) -> Result<Vec<u64>>;
+-        fn uncompressed_sizes(self: &VortexFile) -> Vec<u64>;
+-        fn root_layout_encoding(self: &VortexFile) -> String;
+-        fn row_group_zone_map_count(self: &VortexFile) -> Result<u64>;
+-        fn row_group_zone_map_data_before_zones(self: &VortexFile) -> Result<bool>;
+-        fn zone_map_segment_ids(self: &VortexFile) -> Result<Vec<u64>>;
+-        fn footer_byte_range(self: &VortexFile, file_size: u64) -> Result<Vec<u64>>;
+-        fn segment_bytes(self: &VortexFile, flat_segment_id: u64) -> Result<Vec<u64>>;
+-        fn field_layout_units(self: &VortexFile, field_name: &str) -> Result<Vec<u64>>;
+-        fn prune_row_groups(
+-            self: &VortexFile,
+-            predicate: &str,
+-            candidate_row_group_ids: &[u64],
+-        ) -> Result<Vec<u64>>;
+-        fn vortex_eof_size() -> u64;
+-
+-        unsafe fn open_file(
+-            fswrapper_ptr: *mut u8,
+-            path: &str,
+-            file_size: u64,
+-            footer_size: u64,
+-        ) -> Result<Box<VortexFile>>;
+-
+-        type VortexScanBuilder;
+-        fn with_filter(self: &mut VortexScanBuilder, filter: Box<Expr>);
+-        fn with_filter_ref(self: &mut VortexScanBuilder, filter: &Expr);
+-        fn with_projection(self: &mut VortexScanBuilder, projection: Box<Expr>);
+-        fn with_projection_ref(self: &mut VortexScanBuilder, projection: &Expr);
+-        fn with_row_indices_projection(self: &mut VortexScanBuilder, field_name: &str);
+-        fn with_split_row_indices(self: &mut VortexScanBuilder, split_row_indices: bool);
+-        fn with_row_range(self: &mut VortexScanBuilder, row_range_start: u64, row_range_end: u64);
+-        fn with_row_ranges(self: &mut VortexScanBuilder, starts: &[u64], ends: &[u64]);
+-        fn with_include_by_index(self: &mut VortexScanBuilder, include_by_index: &[u64]);
+-        fn with_limit(self: &mut VortexScanBuilder, limit: u64);
+-        unsafe fn with_output_schema(
+-            self: &mut VortexScanBuilder,
+-            output_schema: *mut u8,
+-        ) -> Result<()>;
+-        unsafe fn scan_builder_into_stream(
+-            builder: Box<VortexScanBuilder>,
+-            out_stream: *mut u8,
+-        ) -> Result<()>;
+-        fn scan_builder_into_raw_handle(builder: Box<VortexScanBuilder>) -> usize;
+-
+-        // IO trace
+-        fn reset_io_trace_ffi();
+-        fn print_io_trace_ffi();
+-        fn disable_io_trace_ffi();
+-
+-        // Row-group zonemap pruning diagnostics
+-        fn reset_row_group_zone_map_pruning_stats_ffi();
+-        fn row_group_zone_map_pruning_stats_ffi() -> RowGroupZoneMapPruningStats;
+-    }
+-
+-    #[repr(u8)]
+-    #[derive(Debug, Clone, Copy)]
+-    enum PType {
+-        U8,
+-        U16,
+-        U32,
+-        U64,
+-        I8,
+-        I16,
+-        I32,
+-        I64,
+-        F16,
+-        F32,
+-        F64,
+-    }
+-}
+-
+-#[cxx::bridge(namespace = "milvus_storage::iceberg::ffi")]
+-pub mod iceberg_ffi {
+-    /// Per-file info returned from plan_files.
+-    struct IcebergFileInfo {
+-        /// Absolute data file URI from Iceberg metadata
+-        data_file_path: String,
+-        /// Physical row count (before deletes)
+-        record_count: u64,
+-        /// Number of rows deleted from this data file
+-        num_deleted_rows: u64,
+-        /// JSON-serialized delete file references.
+-        /// Empty Vec when no deletes apply to this file.
+-        delete_metadata_json: Vec<u8>,
+-    }
+-
+-    extern "Rust" {
+-        /// Plan files for a given Iceberg table + snapshot.
+-        /// Returns one IcebergFileInfo per data file.
+-        ///
+-        /// Uses iceberg-rust's TableScan::plan_files() internally
+-        /// which handles snapshot resolution, delete file association,
+-        /// sequence number filtering, and partition matching.
+-        fn iceberg_plan_files(
+-            metadata_location: &str,
+-            snapshot_id: i64,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-        ) -> Result<Vec<IcebergFileInfo>>;
+-    }
+-}
+-
+-#[cxx::bridge(namespace = "milvus_storage::iceberg::ffi")]
+-pub mod iceberg_test_ffi {
+-    /// Info returned after creating a test Iceberg table.
+-    struct IcebergTestTableInfo {
+-        /// Path to the metadata.json file
+-        metadata_location: String,
+-        /// Snapshot ID of the created snapshot
+-        snapshot_id: i64,
+-        /// URI of the data file written
+-        data_file_uri: String,
+-    }
+-
+-    extern "Rust" {
+-        /// Create a test Iceberg table on local filesystem or cloud storage.
+-        ///
+-        /// Schema: id (int64), name (string), value (float64)
+-        /// Data: id=0..N-1, name="row_0".."row_{N-1}", value=i*1.5
+-        ///
+-        /// For cloud storage, pass storage options (e.g., s3.access-key-id, s3.region).
+-        /// For local filesystem, pass empty storage options.
+-        fn iceberg_create_test_table(
+-            table_dir: &str,
+-            num_rows: u64,
+-            with_positional_deletes: bool,
+-            deleted_positions: Vec<i64>,
+-            storage_options_keys: Vec<String>,
+-            storage_options_values: Vec<String>,
+-            // Empty string = no override. Set e.g. to "gs" when physically
+-            // writing via "s3://" S3-compat to GCS but intending to read via
+-            // native "gs://" — iceberg-rust otherwise bakes the write-time
+-            // scheme into every level of metadata and never swaps it on read.
+-            record_scheme_override: &str,
+-        ) -> Result<IcebergTestTableInfo>;
+-    }
+-}
+diff --git a/cpp/src/format/bridge/rust/src/paimon_bridge.cpp b/cpp/src/format/bridge/rust/src/paimon_bridge.cpp
+index 83f7e84..dd1f87b 100644
+--- a/cpp/src/format/bridge/rust/src/paimon_bridge.cpp
++++ b/cpp/src/format/bridge/rust/src/paimon_bridge.cpp
+@@ -24,7 +24,7 @@
+ #include "bridge_util.h"
+ #include "milvus-storage/common/extend_status.h"
+ #include "rust/cxx.h"
+-#include "rust-bridge/lib.h"
++#include "rust-bridge/external_formats_ffi.h"
+ 
+ namespace milvus_storage::paimon {
+ namespace {
+diff --git a/cpp/src/format/bridge/rust/src/vortex_ffi.rs b/cpp/src/format/bridge/rust/src/vortex_ffi.rs
+new file mode 100644
+index 0000000..0e06a37
+--- /dev/null
++++ b/cpp/src/format/bridge/rust/src/vortex_ffi.rs
+@@ -0,0 +1,193 @@
++// Copyright 2023 Zilliz
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Vortex cxx bridge. It lives apart from lib.rs for the same reason as
++// external_formats_ffi.rs: cxxbridge ignores #[cfg(feature)], so CMake lists
++// this file only when Vortex is enabled.
++
++use crate::vortex_bridgeimpl::*;
++
++#[cxx::bridge(namespace = "milvus_storage::vortex::ffi")]
++pub mod vortex_ffi {
++    struct VortexWriteSummary {
++        file_size: u64,
++        footer_size: u64,
++    }
++
++    struct CoalescingWindow {
++        distance: u64,
++        max_size: u64,
++    }
++
++    struct RowGroupZoneMapPruningStats {
++        prune_eval_count: u64,
++        pruned_row_group_count: u64,
++    }
++
++    extern "Rust" {
++        type DType;
++        // Factory functions for creating DType
++        fn dtype_null() -> Box<DType>;
++        fn dtype_bool(nullable: bool) -> Box<DType>;
++        fn dtype_primitive(ptype: PType, nullable: bool) -> Box<DType>;
++        fn dtype_decimal(precision: u8, scale: i8, nullable: bool) -> Box<DType>;
++        fn dtype_utf8(nullable: bool) -> Box<DType>;
++        fn dtype_binary(nullable: bool) -> Box<DType>;
++        unsafe fn from_arrow(ffi_schema: *mut u8, non_nullable: bool) -> Result<Box<DType>>;
++        // Methods for DType
++        fn to_string(self: &DType) -> String;
++
++        type Scalar;
++        fn bool_scalar_new(value: bool) -> Box<Scalar>;
++        fn i8_scalar_new(value: i8) -> Box<Scalar>;
++        fn i16_scalar_new(value: i16) -> Box<Scalar>;
++        fn i32_scalar_new(value: i32) -> Box<Scalar>;
++        fn i64_scalar_new(value: i64) -> Box<Scalar>;
++        fn u8_scalar_new(value: u8) -> Box<Scalar>;
++        fn u16_scalar_new(value: u16) -> Box<Scalar>;
++        fn u32_scalar_new(value: u32) -> Box<Scalar>;
++        fn u64_scalar_new(value: u64) -> Box<Scalar>;
++        fn f32_scalar_new(value: f32) -> Box<Scalar>;
++        fn f64_scalar_new(value: f64) -> Box<Scalar>;
++        fn string_scalar_new(value: &str) -> Box<Scalar>;
++        fn binary_scalar_new(value: &[u8]) -> Box<Scalar>;
++        fn cast_scalar(self: &Scalar, dtype: &DType) -> Result<Box<Scalar>>;
++
++        type Expr;
++        fn literal(scalar: Box<Scalar>) -> Box<Expr>;
++        fn root() -> Box<Expr>;
++        fn column(name: String) -> Box<Expr>;
++        fn get_item(field: String, child: Box<Expr>) -> Box<Expr>;
++        fn not_(child: Box<Expr>) -> Box<Expr>;
++        fn is_null(child: Box<Expr>) -> Box<Expr>;
++        // binary op
++        fn eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn not_eq_(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn gt(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn gt_eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn lt(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn lt_eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn and_(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn or_(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn checked_add(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr>;
++        fn select(fields: Vec<String>, child: Box<Expr>) -> Box<Expr>;
++
++        type ParsedPredicate;
++        fn parse_predicate_string(
++            predicate: &str,
++            column_names: Vec<String>,
++            column_type_tags: Vec<u8>,
++        ) -> Result<Box<ParsedPredicate>>;
++        fn has_filter(self: &ParsedPredicate) -> bool;
++        fn take_filter(self: &mut ParsedPredicate) -> Box<Expr>;
++
++        // writer
++        type VortexWriter;
++        unsafe fn open_writer(
++            fswrapper_ptr: *mut u8,
++            path: &str,
++            enable_stats: bool,
++            format_version: u32,
++            row_group_size: u64,
++        ) -> Result<Box<VortexWriter>>;
++        unsafe fn write(
++            self: &mut VortexWriter,
++            in_schema: *mut u8,
++            in_array: *mut u8,
++        ) -> Result<()>;
++        unsafe fn flush(self: &mut VortexWriter) -> Result<()>;
++        unsafe fn close(self: &mut VortexWriter) -> Result<VortexWriteSummary>;
++
++        // reader
++        type VortexFile;
++        fn row_count(self: &VortexFile) -> u64;
++        unsafe fn get_schema(self: &VortexFile, out_schema: *mut u8) -> Result<()>;
++        fn scan_builder(
++            self: &VortexFile,
++            window: CoalescingWindow,
++        ) -> Result<Box<VortexScanBuilder>>;
++        unsafe fn scan_builder_with_schema(
++            self: &VortexFile,
++            in_schema: *mut u8,
++        ) -> Result<Box<VortexScanBuilder>>;
++        fn splits(self: &VortexFile) -> Result<Vec<u64>>;
++        fn uncompressed_sizes(self: &VortexFile) -> Vec<u64>;
++        fn root_layout_encoding(self: &VortexFile) -> String;
++        fn row_group_zone_map_count(self: &VortexFile) -> Result<u64>;
++        fn row_group_zone_map_data_before_zones(self: &VortexFile) -> Result<bool>;
++        fn zone_map_segment_ids(self: &VortexFile) -> Result<Vec<u64>>;
++        fn footer_byte_range(self: &VortexFile, file_size: u64) -> Result<Vec<u64>>;
++        fn segment_bytes(self: &VortexFile, flat_segment_id: u64) -> Result<Vec<u64>>;
++        fn field_layout_units(self: &VortexFile, field_name: &str) -> Result<Vec<u64>>;
++        fn prune_row_groups(
++            self: &VortexFile,
++            predicate: &str,
++            candidate_row_group_ids: &[u64],
++        ) -> Result<Vec<u64>>;
++        fn vortex_eof_size() -> u64;
++
++        unsafe fn open_file(
++            fswrapper_ptr: *mut u8,
++            path: &str,
++            file_size: u64,
++            footer_size: u64,
++        ) -> Result<Box<VortexFile>>;
++
++        type VortexScanBuilder;
++        fn with_filter(self: &mut VortexScanBuilder, filter: Box<Expr>);
++        fn with_filter_ref(self: &mut VortexScanBuilder, filter: &Expr);
++        fn with_projection(self: &mut VortexScanBuilder, projection: Box<Expr>);
++        fn with_projection_ref(self: &mut VortexScanBuilder, projection: &Expr);
++        fn with_row_indices_projection(self: &mut VortexScanBuilder, field_name: &str);
++        fn with_split_row_indices(self: &mut VortexScanBuilder, split_row_indices: bool);
++        fn with_row_range(self: &mut VortexScanBuilder, row_range_start: u64, row_range_end: u64);
++        fn with_row_ranges(self: &mut VortexScanBuilder, starts: &[u64], ends: &[u64]);
++        fn with_include_by_index(self: &mut VortexScanBuilder, include_by_index: &[u64]);
++        fn with_limit(self: &mut VortexScanBuilder, limit: u64);
++        unsafe fn with_output_schema(
++            self: &mut VortexScanBuilder,
++            output_schema: *mut u8,
++        ) -> Result<()>;
++        unsafe fn scan_builder_into_stream(
++            builder: Box<VortexScanBuilder>,
++            out_stream: *mut u8,
++        ) -> Result<()>;
++        fn scan_builder_into_raw_handle(builder: Box<VortexScanBuilder>) -> usize;
++
++        // IO trace
++        fn reset_io_trace_ffi();
++        fn print_io_trace_ffi();
++        fn disable_io_trace_ffi();
++
++        // Row-group zonemap pruning diagnostics
++        fn reset_row_group_zone_map_pruning_stats_ffi();
++        fn row_group_zone_map_pruning_stats_ffi() -> RowGroupZoneMapPruningStats;
++    }
++
++    #[repr(u8)]
++    #[derive(Debug, Clone, Copy)]
++    enum PType {
++        U8,
++        U16,
++        U32,
++        U64,
++        I8,
++        I16,
++        I32,
++        I64,
++        F16,
++        F32,
++        F64,
++    }
++}
+diff --git a/cpp/src/format/column_group_lazy_reader.cpp b/cpp/src/format/column_group_lazy_reader.cpp
+index 91033af..af8d8c5 100644
+--- a/cpp/src/format/column_group_lazy_reader.cpp
++++ b/cpp/src/format/column_group_lazy_reader.cpp
+@@ -37,11 +37,15 @@
+ #include "milvus-storage/common/macro.h"  // for UNLIKELY
+ #include "milvus-storage/common/metadata.h"
+ #include "milvus-storage/filesystem/fs.h"
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/iceberg/iceberg_format_reader.h"
+ #include "milvus-storage/format/lance/lance_table_reader.h"
+ #include "milvus-storage/format/paimon/paimon_format_reader.h"
++#endif
+ #include "milvus-storage/format/parquet/parquet_format_reader.h"
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/vortex/vortex_format_reader.h"
++#endif
+ 
+ namespace milvus_storage::api {
+ 
+diff --git a/cpp/src/format/column_group_reader.cpp b/cpp/src/format/column_group_reader.cpp
+index 056cdb9..66ef188 100644
+--- a/cpp/src/format/column_group_reader.cpp
++++ b/cpp/src/format/column_group_reader.cpp
+@@ -43,11 +43,15 @@
+ #include "milvus-storage/common/macro.h"  // for UNLIKELY
+ #include "milvus-storage/common/metadata.h"
+ #include "milvus-storage/filesystem/fs.h"
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/iceberg/iceberg_format_reader.h"
+ #include "milvus-storage/format/lance/lance_table_reader.h"
+ #include "milvus-storage/format/paimon/paimon_format_reader.h"
++#endif
+ #include "milvus-storage/format/parquet/parquet_format_reader.h"
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/vortex/vortex_format_reader.h"
++#endif
+ 
+ namespace milvus_storage::api {
+ 
+diff --git a/cpp/src/format/format.cpp b/cpp/src/format/format.cpp
+index 1950842..99d097b 100644
+--- a/cpp/src/format/format.cpp
++++ b/cpp/src/format/format.cpp
+@@ -21,24 +21,29 @@
+ #include "milvus-storage/common/config.h"
+ #include "milvus-storage/format/format_reader.h"
+ #include "milvus-storage/format/parquet/parquet_format.h"
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/vortex/vortex_format.h"
+ #include "milvus-storage/format/lance/lance_format.h"
+ #include "milvus-storage/format/iceberg/iceberg_format.h"
+ #include "milvus-storage/format/paimon/paimon_format.h"
++#endif
+ #include "milvus-storage/filesystem/fs.h"
+ 
+ namespace milvus_storage {
+ 
+ arrow::Result<Format*> Format::get(const std::string& format) {
+   static ParquetFormat parquet_fmt;
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+   static VortexFormat vortex_fmt;
+   static LanceFormat lance_fmt;
+   static IcebergFormat iceberg_fmt;
+   static PaimonFormat paimon_fmt;
++#endif
+ 
+   if (format == LOON_FORMAT_PARQUET) {
+     return &parquet_fmt;
+   }
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+   if (format == LOON_FORMAT_VORTEX) {
+     return &vortex_fmt;
+   }
+@@ -51,6 +56,13 @@ arrow::Result<Format*> Format::get(const std::string& format) {
+   if (format == LOON_FORMAT_PAIMON_TABLE) {
+     return &paimon_fmt;
+   }
++#else
++  if (format == LOON_FORMAT_VORTEX || format == LOON_FORMAT_LANCE_TABLE || format == LOON_FORMAT_ICEBERG_TABLE ||
++      format == LOON_FORMAT_PAIMON_TABLE) {
++    return arrow::Status::NotImplemented(
++        fmt::format("Format {} is not available: this build has WITH_EXTERNAL_TABLE_FORMATS=OFF", format));
++  }
++#endif
+   return arrow::Status::Invalid(fmt::format("Unknown file format: {}", format));
+ }
+ 
+diff --git a/cpp/src/format/format_reader_cache.cpp b/cpp/src/format/format_reader_cache.cpp
+index 375b031..b9b16cc 100644
+--- a/cpp/src/format/format_reader_cache.cpp
++++ b/cpp/src/format/format_reader_cache.cpp
+@@ -17,11 +17,15 @@
+ #include <exception>
+ #include <utility>
+ 
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/iceberg/iceberg_format_reader.h"
+ #include "milvus-storage/format/paimon/paimon_format_reader.h"
+ #include "milvus-storage/format/lance/lance_table_reader.h"
++#endif
+ #include "milvus-storage/format/parquet/parquet_format_reader.h"
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/vortex/vortex_format_reader.h"
++#endif
+ 
+ namespace milvus_storage {
+ 
+@@ -244,9 +248,11 @@ typename FormatReaderMetadataCache<ReaderT>::MetadataResult FormatReaderMetadata
+ }
+ 
+ template class FormatReaderMetadataCache<parquet::ParquetFormatReader>;
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ template class FormatReaderMetadataCache<vortex::VortexFormatReader>;
+ template class FormatReaderMetadataCache<lance::LanceTableReader>;
+ template class FormatReaderMetadataCache<iceberg::IcebergFormatReader>;
+ template class FormatReaderMetadataCache<paimon::PaimonFormatReader>;
++#endif
+ 
+ }  // namespace milvus_storage
+diff --git a/cpp/src/lob_column/lob_column_reader.cpp b/cpp/src/lob_column/lob_column_reader.cpp
+index 75a61f8..9daac5b 100644
+--- a/cpp/src/lob_column/lob_column_reader.cpp
++++ b/cpp/src/lob_column/lob_column_reader.cpp
+@@ -22,12 +22,24 @@
+ #include <map>
+ #include <unordered_map>
+ 
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++#include "milvus-storage/format/format_reader.h"
++#else
+ #include "milvus-storage/format/vortex/vortex_format_reader.h"
++#endif
+ 
+ namespace milvus_storage::lob_column {
+ 
+ namespace {
+ 
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++// LOB files are Vortex files, which this build leaves out. Inline values are
++// still decoded; GetOrOpenReader refuses to open a LOB file.
++using LobFileReader = FormatReader;
++#else
++using LobFileReader = vortex::VortexFormatReader;
++#endif
++
+ // zero-copy view into an Arrow buffer
+ struct DataView {
+   const uint8_t* data = nullptr;
+@@ -328,7 +340,11 @@ class LobColumnReaderImpl : public LobColumnReader {
+   std::string FieldName() const { return config_.data_type == LobDataType::kText ? "text_data" : "binary_data"; }
+ 
+   // get or open a vortex reader for the given file_id_str (UUID string)
+-  arrow::Result<std::shared_ptr<vortex::VortexFormatReader>> GetOrOpenReader(const std::string& file_id_str) {
++  arrow::Result<std::shared_ptr<LobFileReader>> GetOrOpenReader(const std::string& file_id_str) {
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++    return arrow::Status::NotImplemented("Cannot read LOB file ", file_id_str,
++                                         ": this build has WITH_EXTERNAL_TABLE_FORMATS=OFF, which removes Vortex");
++#else
+     // check cache
+     auto it = reader_cache_.find(file_id_str);
+     if (it != reader_cache_.end()) {
+@@ -352,6 +368,7 @@ class LobColumnReaderImpl : public LobColumnReader {
+     // cache the reader
+     reader_cache_[file_id_str] = reader;
+     return reader;
++#endif
+   }
+ 
+   private:
+@@ -360,7 +377,7 @@ class LobColumnReaderImpl : public LobColumnReader {
+   bool closed_;
+ 
+   // cache of open vortex readers, keyed by file_id
+-  std::unordered_map<std::string, std::shared_ptr<vortex::VortexFormatReader>> reader_cache_;
++  std::unordered_map<std::string, std::shared_ptr<LobFileReader>> reader_cache_;
+ };
+ 
+ // factory function to create LobColumnReader
+diff --git a/cpp/src/lob_column/lob_column_writer.cpp b/cpp/src/lob_column/lob_column_writer.cpp
+index 167620a..0c8735a 100644
+--- a/cpp/src/lob_column/lob_column_writer.cpp
++++ b/cpp/src/lob_column/lob_column_writer.cpp
+@@ -23,7 +23,9 @@
+ #include "milvus-storage/lob_column/lob_reference.h"
+ #include "milvus-storage/filesystem/fs.h"
+ 
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ #include "milvus-storage/format/vortex/vortex_writer.h"
++#endif
+ 
+ namespace milvus_storage::lob_column {
+ 
+@@ -215,6 +217,11 @@ class LobColumnWriterImpl : public LobColumnWriter {
+ 
+   // ensure vortex writer is initialized
+   arrow::Status EnsureVortexWriter() {
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++    return arrow::Status::NotImplemented(
++        "LOB files are not available: this build has WITH_EXTERNAL_TABLE_FORMATS=OFF, which removes Vortex. "
++        "Values below the inline threshold are still stored inline.");
++#else
+     if (vortex_writer_) {
+       return arrow::Status::OK();
+     }
+@@ -241,6 +248,7 @@ class LobColumnWriterImpl : public LobColumnWriter {
+     stats_.lob_files_created++;
+ 
+     return arrow::Status::OK();
++#endif
+   }
+ 
+   // flush pending data to the current vortex file
+@@ -257,8 +265,13 @@ class LobColumnWriterImpl : public LobColumnWriter {
+     });
+     auto batch = arrow::RecordBatch::Make(schema, array->length(), {array});
+ 
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++    (void)batch;
++    return arrow::Status::NotImplemented("LOB files are not available: this build has WITH_EXTERNAL_TABLE_FORMATS=OFF");
++#else
+     ARROW_RETURN_NOT_OK(vortex_writer_->Write(batch));
+     ARROW_RETURN_NOT_OK(vortex_writer_->Flush());
++#endif
+ 
+     current_file_bytes_ += pending_bytes_;
+     pending_bytes_ = 0;
+@@ -272,8 +285,10 @@ class LobColumnWriterImpl : public LobColumnWriter {
+       return arrow::Status::OK();
+     }
+ 
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+     ARROW_ASSIGN_OR_RAISE(auto cgfile, vortex_writer_->Close());
+     (void)cgfile;
++#endif
+ 
+     if (!created_files_.empty()) {
+       auto& last_file = created_files_.back();
+@@ -311,7 +326,12 @@ class LobColumnWriterImpl : public LobColumnWriter {
+   uint8_t current_file_id_[UUID_BINARY_SIZE];  // binary UUID (16 bytes)
+   int64_t current_file_rows_;
+   size_t current_file_bytes_;  // bytes written to current file
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++  // Never set in this build; EnsureVortexWriter refuses to open a LOB file.
++  std::unique_ptr<int> vortex_writer_;
++#else
+   std::unique_ptr<vortex::VortexFileWriter> vortex_writer_;
++#endif
+ 
+   // pending data accumulates directly in Arrow builder to avoid double-copy.
+   // BinaryBuilder works for both text (utf8 is binary-compatible) and binary data.
+diff --git a/cpp/test/CMakeLists.txt b/cpp/test/CMakeLists.txt
+index 8bad862..50c442a 100644
+--- a/cpp/test/CMakeLists.txt
++++ b/cpp/test/CMakeLists.txt
+@@ -14,6 +14,17 @@ set(CMAKE_CXX_FLAGS_DEBUG_INIT "-Wall")
+ 
+ file(GLOB_RECURSE BUSTUB_TEST_SOURCES "${PROJECT_SOURCE_DIR}/test/*.cpp")
+ 
++if (NOT WITH_EXTERNAL_TABLE_FORMATS)
++  # Tests for the formats this build leaves out, and for the tools that use them.
++  list(FILTER BUSTUB_TEST_SOURCES EXCLUDE REGEX ".*/test/format/(lance|iceberg|paimon|vortex)/.*")
++  list(FILTER BUSTUB_TEST_SOURCES EXCLUDE REGEX ".*/test/tools/.*")
++  # These write TEXT/BINARY values above the inline threshold, which need Vortex
++  # LOB files. format/external_formats_disabled_test.cpp covers the OFF behaviour.
++  list(FILTER BUSTUB_TEST_SOURCES EXCLUDE REGEX ".*/test/lob_column/(lob_column_manager_test|lob_column_reader_test|lob_column_writer_edge_test)\\.cpp$")
++  list(FILTER BUSTUB_TEST_SOURCES EXCLUDE REGEX ".*/test/segment/(segment_reader_text_test|segment_writer_test)\\.cpp$")
++  list(FILTER BUSTUB_TEST_SOURCES EXCLUDE REGEX ".*/test/format/(format_reader_cache_test|format_reader_test|external_table_test|external_table_arn_test)\\.cpp$")
++endif()
++
+ add_executable(milvus_test ${BUSTUB_TEST_SOURCES})
+ 
+ target_include_directories(milvus_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+diff --git a/cpp/test/api_transaction_test.cpp b/cpp/test/api_transaction_test.cpp
+index 776faa1..f98dd20 100644
+--- a/cpp/test/api_transaction_test.cpp
++++ b/cpp/test/api_transaction_test.cpp
+@@ -1016,6 +1016,9 @@ TEST_F(TransactionTest, LobFileInfoEquality) {
+ }
+ 
+ TEST_F(TransactionTest, SchemaBasedMixedLocalFormatsTransactionPath) {
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++  GTEST_SKIP() << "Writes a Vortex column group, which this build compiles out";
++#endif
+   ASSERT_AND_ASSIGN(auto batch_v1, CreateTestData(schema_, 0, false, 100));
+ 
+   auto writer_props = properties_;
+diff --git a/cpp/test/api_writer_reader_test.cpp b/cpp/test/api_writer_reader_test.cpp
+index 356eb32..465a3dd 100644
+--- a/cpp/test/api_writer_reader_test.cpp
++++ b/cpp/test/api_writer_reader_test.cpp
+@@ -2792,6 +2792,13 @@ TEST_P(APIWriterReaderTest, ParquetPrebufferHoleSizeLimitReducesReadIOCount) {
+   EXPECT_LT(large_hole_read_count, small_hole_read_count);
+ }
+ 
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++// Vortex is not built; run the Parquet cases only.
++INSTANTIATE_TEST_SUITE_P(APIWriterReaderTestP,
++                         APIWriterReaderTest,
++                         ::testing::Combine(::testing::Values(LOON_FORMAT_PARQUET), ::testing::Values(1, 4)));
++GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(VortexWriterBufferTest);
++#else
+ INSTANTIATE_TEST_SUITE_P(APIWriterReaderTestP,
+                          APIWriterReaderTest,
+                          ::testing::Combine(::testing::Values(LOON_FORMAT_PARQUET, LOON_FORMAT_VORTEX),
+@@ -2800,5 +2807,6 @@ INSTANTIATE_TEST_SUITE_P(APIWriterReaderTestP,
+ INSTANTIATE_TEST_SUITE_P(VortexV2,
+                          VortexWriterBufferTest,
+                          ::testing::Values(std::make_tuple(std::string(LOON_FORMAT_VORTEX), size_t{1})));
++#endif
+ 
+ }  // namespace milvus_storage::test
+diff --git a/cpp/test/ffi/ffi_external_test.c b/cpp/test/ffi/ffi_external_test.c
+index 5ab9808..b511e48 100644
+--- a/cpp/test/ffi/ffi_external_test.c
++++ b/cpp/test/ffi/ffi_external_test.c
+@@ -274,7 +274,9 @@ static void test_exttable_get_file_info_single_file_parquet(void) {
+   test_exttable_get_file_info_single_file("parquet");
+ }
+ 
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+ static void test_exttable_get_file_info_single_file_vortex(void) { test_exttable_get_file_info_single_file("vortex"); }
++#endif
+ 
+ static void test_exttable_get_file_info_directory_error(const char* format) {
+   LoonFFIResult rc;
+@@ -720,7 +722,9 @@ void run_external_suite(void) {
+   RUN_TEST(test_exttable_explore_and_read);
+   RUN_TEST(test_exttable_explore_file_paths_valid);
+   RUN_TEST(test_exttable_get_file_info_single_file_parquet);
++#ifndef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
+   RUN_TEST(test_exttable_get_file_info_single_file_vortex);
++#endif
+   RUN_TEST(test_exttable_get_file_info_directory_error_parquet);
+   RUN_TEST(test_exttable_get_file_info_directory_error_vortex);
+   RUN_TEST(test_exttable_get_file_info_invalid_format);
+diff --git a/cpp/test/filter/predicate_pushdown_test.cpp b/cpp/test/filter/predicate_pushdown_test.cpp
+index 59e457c..780bdc4 100644
+--- a/cpp/test/filter/predicate_pushdown_test.cpp
++++ b/cpp/test/filter/predicate_pushdown_test.cpp
+@@ -241,6 +241,11 @@ TEST_P(PredicatePushdownTest, SyntaxErrorFails) {
+   EXPECT_FALSE(status.ok());
+ }
+ 
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++// Vortex is not built; run the Parquet cases only.
++INSTANTIATE_TEST_SUITE_P(Formats, PredicatePushdownTest, ::testing::Values(LOON_FORMAT_PARQUET));
++#else
+ INSTANTIATE_TEST_SUITE_P(Formats, PredicatePushdownTest, ::testing::Values(LOON_FORMAT_VORTEX, LOON_FORMAT_PARQUET));
++#endif
+ 
+ }  // namespace milvus_storage::test
+diff --git a/cpp/test/format/column_groups_wr_test.cpp b/cpp/test/format/column_groups_wr_test.cpp
+index f201cc1..096b0ac 100644
+--- a/cpp/test/format/column_groups_wr_test.cpp
++++ b/cpp/test/format/column_groups_wr_test.cpp
+@@ -645,8 +645,15 @@ TEST_P(ColumnGroupsWRTest, GetChunksFailWithParallelism) {
+ }
+ #endif  // BUILD_WITH_FIU
+ 
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++// Vortex is not built; run the Parquet cases only.
++INSTANTIATE_TEST_SUITE_P(ColumnGroupsWRTestP,
++                         ColumnGroupsWRTest,
++                         ::testing::Combine(::testing::Values(LOON_FORMAT_PARQUET), ::testing::Values(1, 4)));
++#else
+ INSTANTIATE_TEST_SUITE_P(ColumnGroupsWRTestP,
+                          ColumnGroupsWRTest,
+                          ::testing::Combine(::testing::Values(LOON_FORMAT_PARQUET, LOON_FORMAT_VORTEX),
+                                             ::testing::Values(1, 4)));
++#endif
+ }  // namespace milvus_storage::test
+diff --git a/cpp/test/format/external_formats_disabled_test.cpp b/cpp/test/format/external_formats_disabled_test.cpp
+new file mode 100644
+index 0000000..8bf1285
+--- /dev/null
++++ b/cpp/test/format/external_formats_disabled_test.cpp
+@@ -0,0 +1,101 @@
++// Copyright 2026 Zilliz
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifdef MILVUS_STORAGE_NO_EXTERNAL_FORMATS
++
++#include <gtest/gtest.h>
++
++#include <arrow/filesystem/localfs.h>
++
++#include "milvus-storage/common/config.h"
++#include "milvus-storage/format/format.h"
++#include "milvus-storage/lob_column/lob_column_manager.h"
++#include "milvus-storage/lob_column/lob_column_reader.h"
++#include "milvus-storage/lob_column/lob_column_writer.h"
++#include "milvus-storage/lob_column/lob_reference.h"
++
++namespace milvus_storage {
++
++TEST(ExternalFormatsDisabled, RemovedFormatsReturnNotImplemented) {
++  for (const auto* format :
++       {LOON_FORMAT_VORTEX, LOON_FORMAT_LANCE_TABLE, LOON_FORMAT_ICEBERG_TABLE, LOON_FORMAT_PAIMON_TABLE}) {
++    auto result = Format::get(format);
++    ASSERT_FALSE(result.ok()) << format;
++    EXPECT_TRUE(result.status().IsNotImplemented()) << result.status().ToString();
++    EXPECT_NE(result.status().message().find("WITH_EXTERNAL_TABLE_FORMATS=OFF"), std::string::npos);
++  }
++}
++
++TEST(ExternalFormatsDisabled, ParquetRemainsAvailable) { EXPECT_TRUE(Format::get(LOON_FORMAT_PARQUET).ok()); }
++
++TEST(ExternalFormatsDisabled, UnknownFormatIsStillInvalid) {
++  auto result = Format::get("no-such-format");
++  ASSERT_FALSE(result.ok());
++  EXPECT_TRUE(result.status().IsInvalid()) << result.status().ToString();
++}
++
++class LobWithoutVortexTest : public ::testing::Test {
++  protected:
++  void SetUp() override {
++    dir_ = ::testing::TempDir() + "lob_without_vortex_" +
++           std::to_string(reinterpret_cast<uintptr_t>(this));
++    fs_ = std::make_shared<arrow::fs::LocalFileSystem>();
++    ASSERT_TRUE(fs_->CreateDir(dir_, true).ok());
++    config_.lob_base_path = dir_;
++    config_.data_type = lob_column::LobDataType::kText;
++    config_.inline_threshold = 64;
++  }
++  void TearDown() override { (void)fs_->DeleteDir(dir_); }
++
++  std::string dir_;
++  std::shared_ptr<arrow::fs::FileSystem> fs_;
++  lob_column::LobColumnConfig config_;
++};
++
++// Values under the inline threshold never touch a LOB file, so they still work.
++TEST_F(LobWithoutVortexTest, InlineValuesRoundTrip) {
++  auto writer_result = lob_column::CreateLobColumnWriter(fs_, config_);
++  ASSERT_TRUE(writer_result.ok()) << writer_result.status().ToString();
++  auto writer = std::move(writer_result).ValueOrDie();
++  const std::string text = "short text";
++  auto encoded = writer->WriteData(reinterpret_cast<const uint8_t*>(text.data()), text.size());
++  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
++  auto files = writer->Close();
++  ASSERT_TRUE(files.ok()) << files.status().ToString();
++  EXPECT_TRUE(files->empty());
++
++  auto reader_result = lob_column::CreateLobColumnReader(fs_, config_);
++  ASSERT_TRUE(reader_result.ok()) << reader_result.status().ToString();
++  auto reader = std::move(reader_result).ValueOrDie();
++  auto decoded = reader->ReadData(encoded->data(), encoded->size());
++  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
++  EXPECT_EQ(std::string(decoded->begin(), decoded->end()), text);
++}
++
++// Values over the threshold need a Vortex LOB file, which this build refuses.
++TEST_F(LobWithoutVortexTest, LargeValueReturnsNotImplemented) {
++  auto writer_result = lob_column::CreateLobColumnWriter(fs_, config_);
++  ASSERT_TRUE(writer_result.ok()) << writer_result.status().ToString();
++  auto writer = std::move(writer_result).ValueOrDie();
++  const std::string text(1024, 'x');
++  auto encoded = writer->WriteData(reinterpret_cast<const uint8_t*>(text.data()), text.size());
++  ASSERT_FALSE(encoded.ok());
++  EXPECT_TRUE(encoded.status().IsNotImplemented()) << encoded.status().ToString();
++  EXPECT_NE(encoded.status().message().find("WITH_EXTERNAL_TABLE_FORMATS=OFF"), std::string::npos);
++  EXPECT_TRUE(writer->Abort().ok());
++}
++
++}  // namespace milvus_storage
++
++#endif  // MILVUS_STORAGE_NO_EXTERNAL_FORMATS

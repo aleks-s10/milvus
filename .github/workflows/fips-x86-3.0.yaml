@@ -1,0 +1,108 @@
+# Fork test branch only, never proposed upstream: builds the integrated FIPS 3.0 image
+# (strict + OpenSSL tokenizer TLS + noembedetcd + PBKDF2 + milvus-storage without
+# external table formats) on x86-64, then scans and smoke-tests it.
+name: FIPS x86-64 3.0 integrated
+on:
+  push:
+    branches: [ci/fips-x86-3.0-integrated]
+env:
+  MS_PIN: e5321520
+  FLAGS: MILVUS_FIPS_ENABLED=ON MILVUS_FIPS_STRICT=ON TANTIVY_ANALYZER_REMOTE_TLS=OFF TANTIVY_ANALYZER_REMOTE_TLS_OPENSSL=ON MILVUS_NO_EMBED_ETCD=ON
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: rui314/setup-mold@v1
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 16G /extra.swap && sudo chmod 600 /extra.swap && sudo mkswap /extra.swap >/dev/null && sudo swapon /extra.swap
+          df -h / ; free -h ; nproc
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patched milvus-storage
+        run: |
+          git clone -q https://github.com/milvus-io/milvus-storage.git .ci-fips/ms
+          git -C .ci-fips/ms checkout -q "$MS_PIN"
+          grep -q "$MS_PIN" internal/core/thirdparty/milvus-storage/CMakeLists.txt
+          git -C .ci-fips/ms apply "$PWD/.ci-fips/fips-milvus-storage-3.0.patch"
+          git -C .ci-fips/ms log --oneline -1; git -C .ci-fips/ms diff --stat | tail -1
+      - uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+      - name: Build
+        run: |
+          ./build/builder.sh /bin/bash -c "set -o pipefail; export CMAKE_EXTRA_ARGS='-DFETCHCONTENT_SOURCE_DIR_MILVUS-STORAGE=/go/src/github.com/milvus-io/milvus/.ci-fips/ms -DWITH_EXTERNAL_TABLE_FORMATS=OFF'; make install $FLAGS 2>&1 | tee build.log | grep -E 'Installation successful|FAILED:|fatal error|Error [0-9]+$' || true; test \${PIPESTATUS[0]} -eq 0"
+          tail -3 build.log; grep -q 'Installation successful' build.log
+          grep -m3 -E 'milvus-storage version|no-default-features' build.log | cut -c1-200 || true
+      - uses: ./.github/actions/cache-save
+        if: always()
+        continue-on-error: true
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+      - name: Rebuild provider with gcc 11.2.0
+        run: |
+          docker run --rm --platform linux/amd64 -v "$PWD:/r" -w /r ubuntu:jammy-20240530 bash .ci-fips/provider.sh | tee provider.log
+          grep -q 'INSTALL PASSED' provider.log
+          grep -q 'GCC: (Ubuntu 11.2.0-19ubuntu1) 11.2.0' provider.log
+          sudo cp internal/core/output/lib/ossl-modules/fips.so lib/ossl-modules/fips.so
+          sudo rm -f lib/ossl-modules/legacy.so
+          sudo chown -R "$(id -u)" configs/ssl lib/ossl-modules
+          ls -la lib/ossl-modules
+      - name: Build image
+        run: |
+          df -h /
+          docker build --network host --build-arg TARGETARCH=amd64 --platform linux/amd64 -f build/docker/milvus/ubuntu22.04/Dockerfile -t fipslocal/milvus:ci . > image.log 2>&1 || { tail -30 image.log; exit 1; }
+          grep -E 'INSTALL PASSED' image.log || true
+          docker images fipslocal/milvus:ci
+          docker save fipslocal/milvus:ci | zstd -T0 -3 -o image.tar.zst; ls -la image.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.zst
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: |
+            build.log
+            provider.log
+            image.log
+          if-no-files-found: ignore
+  checks:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - name: Load image
+        run: zstd -dc image.tar.zst | docker load && rm image.tar.zst
+      - name: In-house scan
+        run: |
+          mkdir -p .ci-fips/logs/scan x root/usr
+          cid=$(docker create fipslocal/milvus:ci); docker cp -q $cid:/milvus x/m; docker cp -q $cid:/usr/bin root/usr/bin; docker rm $cid >/dev/null
+          DV=$(grep '^DATE_VERSION=' .env | cut -d= -f2)
+          docker run --rm -v $PWD/x/m:/x:ro -v $PWD/root:/x-root:ro -v $PWD/.ci-fips/logs/scan:/out -v $PWD/.ci-fips:/l:ro --entrypoint bash milvusdb/milvus-env:ubuntu22.04-$DV /l/scan-inside.sh | tee .ci-fips/logs/scan/inhouse.txt
+          P=x/m/lib/libmilvus-planparser.so
+          docker run --rm -v $PWD/x/m:/x:ro --entrypoint bash milvusdb/milvus-env:ubuntu22.04-$DV -c 'go version -m /x/lib/libmilvus-planparser.so | grep -E "^\s+build\s+(-tags|GOEXPERIMENT)"; go tool nm /x/lib/libmilvus-planparser.so > /tmp/n; echo "planparser: etcdserver=$(grep -c go.etcd.io/etcd/server /tmp/n) bcrypt=$(grep -c x/crypto/bcrypt /tmp/n) boring=$(grep -c crypto/internal/boring /tmp/n)"' | tee -a .ci-fips/logs/scan/inhouse.txt
+          ls x/m/lib/ossl-modules | tee -a .ci-fips/logs/scan/inhouse.txt
+      - name: Build tokenizer test server
+        run: |
+          docker run --rm -v $PWD/.ci-fips/tt-server:/s -w /s rust:1.85.0-bookworm cargo build --release --locked -q
+          mkdir -p .ci-fips/tt-server-bin && cp .ci-fips/tt-server/target/release/tt-server .ci-fips/tt-server-bin/
+      - name: Smoke test
+        run: bash .ci-fips/e2e-ci.sh fipslocal/milvus:ci 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks
+          path: .ci-fips/logs/
+          if-no-files-found: ignore
