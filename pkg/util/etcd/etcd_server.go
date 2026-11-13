@@ -1,3 +1,5 @@
+//go:build !noembedetcd
+
 package etcd
 
 import (
@@ -73,4 +75,13 @@ func StopEtcdServer() {
 			etcdServer.Close()
 		})
 	}
+}
+
+// GetEmbedEtcdEndpoints returns etcd listener address for endpoint config.
+func GetEmbedEtcdEndpoints(server *embed.Etcd) []string {
+	addrs := make([]string, 0, len(server.Clients))
+	for _, l := range server.Clients {
+		addrs = append(addrs, l.Addr().String())
+	}
+	return addrs
 }

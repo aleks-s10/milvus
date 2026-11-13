@@ -1,3 +1,5 @@
+//go:build !noembedetcd
+
 // Licensed to the LF AI & Data foundation under one
 // or more contributor license agreements. See the NOTICE file
 // distributed with this work for additional information
@@ -38,11 +40,6 @@ import (
 // implementation assertion
 var _ kv.MetaKv = (*EmbedEtcdKV)(nil)
 
-const (
-	defaultRetryCount    = 3
-	defaultRetryInterval = 1 * time.Second
-)
-
 // EmbedEtcdKV use embedded Etcd instance as a KV storage
 type EmbedEtcdKV struct {
 	client    *clientv3.Client
@@ -51,16 +48,6 @@ type EmbedEtcdKV struct {
 	closeOnce sync.Once
 
 	requestTimeout time.Duration
-}
-
-func retry(attempts int, sleep time.Duration, fn func() error) error {
-	for i := 0; ; i++ {
-		err := fn()
-		if err == nil || i >= (attempts-1) {
-			return err
-		}
-		time.Sleep(sleep)
-	}
 }
 
 // NewEmbededEtcdKV creates a new etcd kv.

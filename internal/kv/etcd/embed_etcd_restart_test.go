@@ -1,3 +1,6 @@
+//go:build !noembedetcd
+
+
 // Licensed to the LF AI & Data foundation under one
 // or more contributor license agreements. See the NOTICE file
 // distributed with this work for additional information

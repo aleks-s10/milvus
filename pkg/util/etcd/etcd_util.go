@@ -29,7 +29,6 @@ import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/server/v3/embed"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -340,15 +339,6 @@ func buildKvGroup(keys, values []string) (map[string]string, error) {
 		ret[k] = values[i]
 	}
 	return ret, nil
-}
-
-// GetEmbedEtcdEndpoints returns etcd listener address for endpoint config.
-func GetEmbedEtcdEndpoints(server *embed.Etcd) []string {
-	addrs := make([]string, 0, len(server.Clients))
-	for _, l := range server.Clients {
-		addrs = append(addrs, l.Addr().String())
-	}
-	return addrs
 }
 
 func HealthCheck(useEmbedEtcd bool,

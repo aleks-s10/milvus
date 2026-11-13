@@ -20,8 +20,6 @@ import (
 	"context"
 	"time"
 
-	"go.etcd.io/etcd/server/v3/embed"
-
 	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
@@ -35,23 +33,7 @@ func NewWatchKVFactory(rootPath string, etcdCfg *paramtable.EtcdConfig) (kv.Watc
 		mlog.String("rootpath", rootPath),
 		mlog.Bool("isEmbed", etcdCfg.UseEmbedEtcd.GetAsBool()))
 	if etcdCfg.UseEmbedEtcd.GetAsBool() {
-		path := etcdCfg.ConfigPath.GetValue()
-		var cfg *embed.Config
-		if len(path) > 0 {
-			cfgFromFile, err := embed.ConfigFromFile(path)
-			if err != nil {
-				return nil, err
-			}
-			cfg = cfgFromFile
-		} else {
-			cfg = embed.NewConfig()
-		}
-		cfg.Dir = etcdCfg.DataDir.GetValue()
-		watchKv, err := NewEmbededEtcdKV(cfg, rootPath, WithRequestTimeout(etcdCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
-		if err != nil {
-			return nil, err
-		}
-		return watchKv, err
+		return newEmbedWatchKV(rootPath, etcdCfg)
 	}
 	client, err := etcd.CreateEtcdClient(
 		etcdCfg.UseEmbedEtcd.GetAsBool(),
