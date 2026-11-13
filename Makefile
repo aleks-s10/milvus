@@ -92,8 +92,10 @@ endif
 
 # Local FIPS integration only: MILVUS_NO_EMBED_ETCD=ON builds without the
 # embedded etcd server (requires external etcd).
+PLAN_PARSER_GO_TAGS :=
 ifeq ($(MILVUS_NO_EMBED_ETCD),ON)
 	MILVUS_GO_BUILD_TAGS := $(MILVUS_GO_BUILD_TAGS),noembedetcd
+	PLAN_PARSER_GO_TAGS := $(PLAN_PARSER_GO_TAGS),noembedetcd
 endif
 
 # FIPS strict: default OFF. Set MILVUS_FIPS_STRICT=ON (with MILVUS_FIPS_ENABLED=ON)
@@ -109,6 +111,7 @@ $(error MILVUS_FIPS_STRICT=ON requires TANTIVY_ANALYZER_REMOTE_TLS=OFF)
 endif
 	tantivy_analyzer_remote_tls = OFF
 	MILVUS_GO_BUILD_TAGS := $(MILVUS_GO_BUILD_TAGS),fipsstrict
+	PLAN_PARSER_GO_TAGS := $(PLAN_PARSER_GO_TAGS),fipsstrict
 endif
 # golangci-lint
 GOLANGCI_LINT_VERSION := 2.11.3
@@ -474,7 +477,7 @@ run-test-cpp:
 	@(env bash $(PWD)/scripts/run_cpp_unittest.sh arg=${filter})
 
 plan-parser-lib:
-	@(env bash $(PWD)/scripts/build_plan_parser.sh)
+	@(env $(GOEXPERIMENT_FLAG) PLAN_PARSER_GO_TAGS="$(PLAN_PARSER_GO_TAGS)" bash $(PWD)/scripts/build_plan_parser.sh)
 
 # Run code coverage.
 codecov: codecov-go codecov-cpp
