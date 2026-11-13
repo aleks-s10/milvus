@@ -1,0 +1,89 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package http
+
+// HealthRouterPath is default path for check health state.
+const HealthRouterPath = "/healthz"
+
+// MetricsRouterPath is path for Prometheus metrics.
+const MetricsRouterPath = "/metrics"
+
+// LogLevelRouterPath is path for Get and Update log level at runtime.
+const LogLevelRouterPath = "/log/level"
+
+// AdminMemberlistPath is path for memberlist status.
+const AdminMemberlistPath = "/admin/memberlist"
+
+// AdminNodeStatusPath is path for node status API.
+const AdminNodeStatusPath = "/admin/node/status"
+
+// AdminNodeDecommissionPath is path for node decommission API.
+const AdminNodeDecommissionPath = "/admin/node/decommission"
+
+// AdminNodeDecommissionProgressPath is path for node decommission progress API.
+const AdminNodeDecommissionProgressPath = "/admin/node/decommission/progress"
+
+// AdminNodeDecommissionCancelPath is path for POST /admin/node/decommission/cancel.
+const AdminNodeDecommissionCancelPath = "/admin/node/decommission/cancel"
+
+// AdminConfigPath is path for GET /admin/config.
+const AdminConfigPath = "/admin/config"
+
+// AdminEnvPath is path for GET /admin/env.
+const AdminEnvPath = "/admin/env"
+
+// AdminLogHealthPath is the path for node-wide per-log read/write health.
+const AdminLogHealthPath = "/admin/log-health"
+
+// C family — logstore runtime
+const (
+	AdminLogstoreSegmentsPath = "/admin/logstore/segments"
+	AdminLogstoreFlushPath    = "/admin/logstore/flush"
+	AdminLogstoreFencePath    = "/admin/logstore/fence"
+	AdminLogstoreCompactPath  = "/admin/logstore/compact"
+	AdminLogstoreProbePath    = "/admin/logstore/segment/probe"
+	AdminLogstoreInspectPath  = "/admin/logstore/segment/inspect"
+)
+
+// AdminLogDeletePath marks a single log deleted: POST {bucketName, rootPath, logId}.
+const AdminLogDeletePath = "/admin/log/delete"
+
+// AdminInstanceDeletePath marks a whole instance deleted: POST {bucketName, rootPath}.
+const AdminInstanceDeletePath = "/admin/instance/delete"
+
+// AdminInstanceDataPath lists the instances holding node-local data, optionally filtered:
+// GET ?bucket_name=<bucket>&root_path=<root>. Read half of the /admin/instance family.
+const AdminInstanceDataPath = "/admin/instance/data"
+
+// G family — ops registry
+const (
+	AdminRuntimeOpsPath      = "/admin/runtime/ops"
+	AdminRuntimeOpsStatsPath = "/admin/runtime/ops/stats"
+)
+
+// Pprof paths are automatically registered by importing net/http/pprof
+// Available paths:
+// - /debug/pprof/
+// - /debug/pprof/cmdline
+// - /debug/pprof/profile
+// - /debug/pprof/symbol
+// - /debug/pprof/trace
+// - /debug/pprof/heap
+// - /debug/pprof/goroutine
+// - /debug/pprof/threadcreate
+// - /debug/pprof/block
+// - /debug/pprof/mutex

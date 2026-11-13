@@ -1,0 +1,478 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package objectstorage
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
+
+	"github.com/zilliztech/woodpecker/common/config"
+	"github.com/zilliztech/woodpecker/common/logger"
+	"github.com/zilliztech/woodpecker/common/metrics"
+	minioHandler "github.com/zilliztech/woodpecker/common/minio"
+	"github.com/zilliztech/woodpecker/common/retry"
+	"github.com/zilliztech/woodpecker/common/werr"
+)
+
+var CheckBucketRetryAttempts uint = 20
+
+// AzureBlobClient abstracts Azure block blob operations for testability.
+// *blockblob.Client satisfies this interface via duck typing.
+type AzureBlobClient interface {
+	DownloadStream(ctx context.Context, o *blob.DownloadStreamOptions) (blob.DownloadStreamResponse, error)
+	UploadStream(ctx context.Context, body io.Reader, o *azblob.UploadStreamOptions) (blockblob.UploadStreamResponse, error)
+	Delete(ctx context.Context, o *blob.DeleteOptions) (blob.DeleteResponse, error)
+	GetProperties(ctx context.Context, o *blob.GetPropertiesOptions) (blob.GetPropertiesResponse, error)
+}
+
+// FlatBlobPager abstracts the pager for flat blob listing.
+type FlatBlobPager interface {
+	More() bool
+	NextPage(ctx context.Context) (container.ListBlobsFlatResponse, error)
+}
+
+// HierarchyBlobPager abstracts the pager for hierarchy blob listing.
+type HierarchyBlobPager interface {
+	More() bool
+	NextPage(ctx context.Context) (container.ListBlobsHierarchyResponse, error)
+}
+
+// AzureServiceClientAPI abstracts Azure service-level operations for testability.
+type AzureServiceClientAPI interface {
+	GetBlobClient(containerName, blobName string) AzureBlobClient
+	NewListBlobsFlatPager(containerName string, opts *azblob.ListBlobsFlatOptions) FlatBlobPager
+	NewListBlobsHierarchyPager(containerName, delimiter string, opts *container.ListBlobsHierarchyOptions) HierarchyBlobPager
+}
+
+// azureServiceClientWrapper wraps *service.Client to satisfy AzureServiceClientAPI.
+type azureServiceClientWrapper struct {
+	client *service.Client
+}
+
+func (w *azureServiceClientWrapper) GetBlobClient(containerName, blobName string) AzureBlobClient {
+	return w.client.NewContainerClient(containerName).NewBlockBlobClient(blobName)
+}
+
+func (w *azureServiceClientWrapper) NewListBlobsFlatPager(containerName string, opts *azblob.ListBlobsFlatOptions) FlatBlobPager {
+	return w.client.NewContainerClient(containerName).NewListBlobsFlatPager(opts)
+}
+
+func (w *azureServiceClientWrapper) NewListBlobsHierarchyPager(containerName, delimiter string, opts *container.ListBlobsHierarchyOptions) HierarchyBlobPager {
+	return w.client.NewContainerClient(containerName).NewListBlobsHierarchyPager(delimiter, opts)
+}
+
+var _ minioHandler.FileReader = (*BlobReader)(nil)
+
+// BlobReader is implemented because Azure's stream body does not have ReadAt and Seek interfaces.
+// BlobReader is not concurrency safe.
+type BlobReader struct {
+	client          AzureBlobClient
+	position        int64
+	count           int64
+	body            io.ReadCloser
+	contentLength   int64
+	needResetStream bool
+}
+
+// NewBlobReader construct a full blob reader
+// Deprecated
+func NewBlobReader(client AzureBlobClient, offset int64) (*BlobReader, error) {
+	return &BlobReader{client: client, position: offset, count: 0, needResetStream: true}, nil
+}
+
+func NewBlobReaderWithSize(client AzureBlobClient, offset int64, size int64) (*BlobReader, error) {
+	return &BlobReader{client: client, position: offset, count: size, needResetStream: true}, nil
+}
+
+func (b *BlobReader) Read(p []byte) (n int, err error) {
+	ctx := context.Background()
+
+	if b.needResetStream {
+		opts := &blob.DownloadStreamOptions{
+			Range: blob.HTTPRange{
+				Offset: b.position,
+				Count:  b.count,
+			},
+		}
+		object, err := b.client.DownloadStream(ctx, opts)
+		if err != nil {
+			return 0, err
+		}
+		b.body = object.Body
+		b.contentLength = *object.ContentLength
+	}
+
+	n, err = b.body.Read(p)
+	if err != nil {
+		return n, err
+	}
+	b.position += int64(n)
+	b.needResetStream = false
+	return n, nil
+}
+
+func (b *BlobReader) Close() error {
+	if b.body != nil {
+		return b.body.Close()
+	}
+	return nil
+}
+
+func (b *BlobReader) ReadAt(p []byte, off int64) (n int, err error) {
+	httpRange := blob.HTTPRange{
+		Offset: off,
+		Count:  int64(len(p)),
+	}
+	object, err := b.client.DownloadStream(context.Background(), &blob.DownloadStreamOptions{
+		Range: httpRange,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer object.Body.Close()
+	return io.ReadFull(object.Body, p)
+}
+
+func (b *BlobReader) Seek(offset int64, whence int) (int64, error) {
+	props, err := b.client.GetProperties(context.Background(), &blob.GetPropertiesOptions{})
+	if err != nil {
+		return 0, err
+	}
+	size := *props.ContentLength
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = b.position + offset
+	case io.SeekEnd:
+		newOffset = size + offset
+	default:
+		return 0, werr.ErrFileReaderSeek.WithCauseErrMsg("invalid whence")
+	}
+
+	b.position = newOffset
+	b.needResetStream = true
+	return newOffset, nil
+}
+
+func (b *BlobReader) Size() (int64, error) {
+	return b.contentLength, nil
+}
+
+var _ ObjectStorage = (*AzureObjectStorage)(nil)
+
+type AzureObjectStorage struct {
+	client AzureServiceClientAPI
+}
+
+func newAzureObjectStorageWithConfig(ctx context.Context, c *config.Configuration) (*AzureObjectStorage, error) {
+	client, err := newAzureObjectStorageClient(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return &AzureObjectStorage{client: &azureServiceClientWrapper{client: client}}, nil
+}
+
+func newAzureObjectStorageClient(ctx context.Context, c *config.Configuration) (*service.Client, error) {
+	var client *service.Client
+	var err error
+	if c.Minio.UseIAM {
+		var cred azcore.TokenCredential
+		var credErr error
+		if os.Getenv("AZURE_FEDERATED_TOKEN_FILE") != "" {
+			cred, credErr = azidentity.NewWorkloadIdentityCredential(&azidentity.WorkloadIdentityCredentialOptions{
+				ClientID:      os.Getenv("AZURE_CLIENT_ID"),
+				TenantID:      os.Getenv("AZURE_TENANT_ID"),
+				TokenFilePath: os.Getenv("AZURE_FEDERATED_TOKEN_FILE"),
+			})
+		} else {
+			clientID := os.Getenv("AZURE_CLIENT_ID")
+			managedIdentityID := azidentity.ClientID("") // Default to System Assigned
+
+			if clientID != "" {
+				managedIdentityID = azidentity.ClientID(clientID)
+			}
+
+			cred, credErr = azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+				ID: managedIdentityID,
+			})
+		}
+		if credErr != nil {
+			return nil, credErr
+		}
+		client, err = service.NewClient("https://"+c.Minio.AccessKeyID+".blob."+c.Minio.Address+"/", cred, &service.ClientOptions{})
+	} else {
+		connectionString := os.Getenv("AZURE_STORAGE_CONNECTION_STRING")
+		if connectionString == "" {
+			connectionString = "DefaultEndpointsProtocol=https;AccountName=" + c.Minio.AccessKeyID +
+				";AccountKey=" + c.Minio.SecretAccessKey + ";EndpointSuffix=" + c.Minio.Address
+		}
+		client, err = service.NewClientFromConnectionString(connectionString, &service.ClientOptions{})
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Only check/create the container when CreateBucket is set. In service mode
+	// Woodpecker is caller-managed (per-request bucket/rootPath), so startup must not
+	// depend on a global container — nor even on a configured bucket name. When
+	// CreateBucket is false we skip the whole block. See newMinioClient.
+	if c.Minio.CreateBucket {
+		if c.Minio.BucketName == "" {
+			return nil, werr.ErrInvalidConfiguration.WithCauseErrMsg("invalid empty bucket name")
+		}
+		// check valid in first query
+		checkBucketFn := func() error {
+			_, err := client.NewContainerClient(c.Minio.BucketName).GetProperties(ctx, &container.GetPropertiesOptions{})
+			if err != nil {
+				switch err := err.(type) {
+				case *azcore.ResponseError:
+					if err.ErrorCode == string(bloberror.ContainerNotFound) {
+						_, createErr := client.NewContainerClient(c.Minio.BucketName).Create(ctx, &azblob.CreateContainerOptions{})
+						if createErr != nil {
+							return createErr
+						}
+						return nil
+					}
+				}
+			}
+			return err
+		}
+		if err = retry.Do(ctx, checkBucketFn, retry.Attempts(CheckBucketRetryAttempts)); err != nil {
+			return nil, err
+		}
+	}
+	return client, nil
+}
+
+func (a *AzureObjectStorage) GetObject(ctx context.Context, bucketName, objectName string, offset int64, size int64, operatingNamespace string, operatingLogId string) (minioHandler.FileReader, error) {
+	// Deliberately uncounted. NewBlobReaderWithSize hands back a reader without issuing a
+	// request, so anything recorded here would be an unconditional success and a latency
+	// sample timing a struct allocation. The transfer happens in BlobReader.Read/ReadAt, and
+	// instrumenting there is a separate change -- the MinIO side is lazy in the same way.
+	return NewBlobReaderWithSize(a.client.GetBlobClient(bucketName, objectName), offset, size)
+}
+
+func (a *AzureObjectStorage) PutObject(ctx context.Context, bucketName, objectName string, reader io.Reader, objectSize int64, operatingNamespace string, operatingLogId string) error {
+	start := time.Now()
+	_, err := a.client.GetBlobClient(bucketName, objectName).UploadStream(ctx, reader, &azblob.UploadStreamOptions{})
+	// A write is not an existence check: a failure here is a failure, never "not found".
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	metrics.WpObjectStorageOperationsTotal.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "put_object", status).Inc()
+	metrics.WpObjectStorageOperationLatency.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "put_object", status).Observe(float64(time.Since(start).Milliseconds()))
+	if err == nil {
+		metrics.WpObjectStorageBytesTransferred.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "put_object").Add(float64(objectSize))
+		metrics.WpObjectStorageRequestBytes.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "put_object").Observe(float64(objectSize))
+	}
+	return err
+}
+
+func (a *AzureObjectStorage) PutObjectIfNoneMatch(ctx context.Context, bucketName, objectName string, reader io.Reader, objectSize int64, operatingNamespace string, operatingLogId string) error {
+	start := time.Now()
+	eTagAny := azcore.ETag("*")
+	_, err := a.client.GetBlobClient(bucketName, objectName).UploadStream(ctx, reader, &azblob.UploadStreamOptions{
+		AccessConditions: &azblob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+				IfNoneMatch: &eTagAny,
+			},
+		},
+	})
+
+	if err != nil && a.IsPreconditionFailedError(err) {
+		objSize, isFencedObject, stateErr := a.StatObject(ctx, bucketName, objectName, operatingNamespace, operatingLogId)
+		if stateErr != nil {
+			// return normal err, let task retry
+			return stateErr
+		}
+		if isFencedObject {
+			logger.Ctx(ctx).Info("object already exists and it is a fence object", zap.String("objectName", objectName))
+			return werr.ErrSegmentFenced.WithCauseErrMsg("already fenced")
+		}
+		// means it is a normal object already uploaded before this retry, idempotent flush success
+		metrics.WpObjectStorageOperationsTotal.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "condition_put_object", "success").Inc()
+		metrics.WpObjectStorageOperationLatency.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "condition_put_object", "success").Observe(float64(time.Since(start).Milliseconds()))
+		metrics.WpObjectStorageBytesTransferred.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "condition_put_object").Add(float64(objSize))
+		logger.Ctx(ctx).Info("object already exists, idempotent flush success", zap.String("objectKey", objectName))
+		return werr.ErrObjectAlreadyExists
+	}
+	if err != nil {
+		metrics.WpObjectStorageOperationsTotal.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "condition_put_object", "error").Inc()
+		metrics.WpObjectStorageOperationLatency.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "condition_put_object", "error").Observe(float64(time.Since(start).Milliseconds()))
+		return err
+	}
+
+	return err
+}
+
+func (a *AzureObjectStorage) PutFencedObject(ctx context.Context, bucketName, objectName string, operatingNamespace string, operatingLogId string) error {
+	start := time.Now()
+	fencedObjectReader := bytes.NewReader([]byte("F"))
+	eTagAny := azcore.ETag("*")
+	isFencedObject := "true"
+	_, err := a.client.GetBlobClient(bucketName, objectName).UploadStream(ctx, fencedObjectReader, &azblob.UploadStreamOptions{
+		AccessConditions: &azblob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+				IfNoneMatch: &eTagAny,
+			},
+		},
+		Metadata: map[string]*string{
+			minioHandler.FencedObjectMetaKey: &isFencedObject,
+		},
+	})
+	if err != nil && a.IsPreconditionFailedError(err) {
+		_, isFenced, stateErr := a.StatObject(ctx, bucketName, objectName, operatingNamespace, operatingLogId)
+		if stateErr != nil {
+			// return normal err
+			return stateErr
+		}
+		if isFenced {
+			// already fenced, return success
+			logger.Ctx(ctx).Info("found fenced object exists, skip", zap.String("objectName", objectName))
+			return nil
+		}
+		// return normal err
+		return werr.ErrObjectAlreadyExists
+	}
+	if err != nil {
+		metrics.WpObjectStorageOperationsTotal.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "put_fenced_object", "error").Inc()
+		metrics.WpObjectStorageOperationLatency.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "put_fenced_object", "error").Observe(float64(time.Since(start).Milliseconds()))
+		return err
+	}
+
+	return err
+}
+
+func (a *AzureObjectStorage) StatObject(ctx context.Context, bucketName, objectName string, operatingNamespace string, operatingLogId string) (int64, bool, error) {
+	start := time.Now()
+	info, err := a.client.GetBlobClient(bucketName, objectName).GetProperties(ctx, &blob.GetPropertiesOptions{})
+	if err != nil {
+		status := a.readStatus(err)
+		metrics.WpObjectStorageOperationsTotal.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "stat_object", status).Inc()
+		metrics.WpObjectStorageOperationLatency.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "stat_object", status).Observe(float64(time.Since(start).Milliseconds()))
+		return 0, false, err
+	}
+	metrics.WpObjectStorageOperationsTotal.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "stat_object", "success").Inc()
+	metrics.WpObjectStorageOperationLatency.WithLabelValues(metrics.NodeID, operatingNamespace, operatingLogId, "stat_object", "success").Observe(float64(time.Since(start).Milliseconds()))
+	isFencedObject := info.Metadata[minioHandler.FencedObjectMetaKey]
+	if isFencedObject != nil && len(*isFencedObject) > 0 && *isFencedObject == "true" {
+		return *info.ContentLength, true, nil
+	}
+	return *info.ContentLength, false, nil
+}
+
+func (a *AzureObjectStorage) WalkWithObjects(ctx context.Context, bucketName string, prefix string, recursive bool, walkFunc ChunkObjectWalkFunc, operatingNamespace string, operatingLogId string) error {
+	if recursive {
+		pager := a.client.NewListBlobsFlatPager(bucketName, &azblob.ListBlobsFlatOptions{
+			Prefix: &prefix,
+		})
+		for pager.More() {
+			pageResp, err := pager.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+			for _, blobItem := range pageResp.Segment.BlobItems {
+				if !walkFunc(&ChunkObjectInfo{FilePath: *blobItem.Name, ModifyTime: *blobItem.Properties.LastModified, Size: *blobItem.Properties.ContentLength}) {
+					return nil
+				}
+			}
+		}
+	} else {
+		pager := a.client.NewListBlobsHierarchyPager(bucketName, "/", &container.ListBlobsHierarchyOptions{
+			Prefix: &prefix,
+		})
+		for pager.More() {
+			pageResp, err := pager.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+
+			for _, blobItem := range pageResp.Segment.BlobItems {
+				if !walkFunc(&ChunkObjectInfo{FilePath: *blobItem.Name, ModifyTime: *blobItem.Properties.LastModified, Size: *blobItem.Properties.ContentLength}) {
+					return nil
+				}
+			}
+			for _, blobPrefix := range pageResp.Segment.BlobPrefixes {
+				if !walkFunc(&ChunkObjectInfo{FilePath: *blobPrefix.Name, ModifyTime: time.Now()}) {
+					return nil
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (a *AzureObjectStorage) RemoveObject(ctx context.Context, bucketName, objectName string, operatingNamespace string, operatingLogId string) error {
+	_, err := a.client.GetBlobClient(bucketName, objectName).Delete(ctx, &blob.DeleteOptions{})
+	return err
+}
+
+// readStatus labels a failed read or probe on this backend, using this backend's own
+// not-exists predicate rather than a second copy of the rule. A missing blob is the expected
+// answer to an existence check -- has this compacted footer been uploaded yet -- so counting it
+// as an error makes the obvious object-storage error ratio meaningless.
+func (a *AzureObjectStorage) readStatus(err error) string {
+	// A 404 on the container is not a missing object -- it is an unavailable backend, and the
+	// container is only created when Minio.CreateBucket is set, so an absent one is a reachable
+	// steady state rather than a startup misconfiguration. azcore fills ErrorCode from the
+	// x-ms-error-code header, which GetProperties returns.
+	var azError *azcore.ResponseError
+	if errors.As(err, &azError) && bloberror.Code(azError.ErrorCode) == bloberror.ContainerNotFound {
+		return "error"
+	}
+	if a.IsObjectNotExistsError(err) {
+		return "not_found"
+	}
+	return "error"
+}
+
+// IsObjectNotExistsError check if the error is object not exists
+// error code:https://learn.microsoft.com/en-us/azure/storage/common/storage-ref-azcopy-error-codes
+func (a *AzureObjectStorage) IsObjectNotExistsError(err error) bool {
+	var azError *azcore.ResponseError
+	if err != nil && errors.As(err, &azError) {
+		return azError.StatusCode == http.StatusNotFound
+	}
+	return false
+}
+
+// IsPreconditionFailedError check if the error is precondition failed
+// error code:https://learn.microsoft.com/en-us/azure/storage/common/storage-ref-azcopy-error-codes
+func (a *AzureObjectStorage) IsPreconditionFailedError(err error) bool {
+	var azError *azcore.ResponseError
+	if err != nil && errors.As(err, &azError) {
+		return azError.StatusCode == http.StatusPreconditionFailed || azError.StatusCode == http.StatusConflict
+	}
+	return false
+}

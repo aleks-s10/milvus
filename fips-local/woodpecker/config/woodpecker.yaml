@@ -1,0 +1,359 @@
+# Licensed to the LF AI & Data foundation under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This file is used to configure Woodpecker service.
+
+woodpecker:
+  # Configuration of Woodpecker metadata storage.
+  meta:
+    type: etcd # Type of the meta data storage, currently only etcd is supported.
+    prefix: woodpecker # Root prefix of the key to where Woodpecker stores data in etcd.
+  # Configuration of Woodpecker Client.
+  client:
+    segmentAppend:
+      queueSize: 10000 # Maximum number of queued segment append requests, default is 10000
+      maxRetries: 3 # Maximum number of retries for segment append operations
+      maxBatchEntries: 1000 # Client-side group commit: max consecutive appends coalesced into one AddEntries request. Opportunistic (only batches already-queued ops, adds no latency at low load). Set to 1 to disable batching.
+      maxBatchBytes: 2000000 # Max total payload (bytes) of a coalesced batch, default 2MB; whichever of maxBatchEntries/maxBatchBytes is hit first bounds the batch. Ignored when maxBatchEntries <= 1.
+      sendTimeout: 2000 # Milliseconds allowed for sending an append to one replica: opening the stream and receiving its first (buffered) response. Every later append of the log waits while a send does, so a replica that has not answered by then is taken as unreachable and the segment rolls away from it. Default 2000.
+    segmentRollingPolicy:
+      maxSize: 256000000 # Maximum segment size in bytes, default is 256MB. Increase this value for high write throughput scenarios to minimize frequent segment rolling.
+      maxInterval: 600 # Maximum interval between two segments in seconds, default is 10 minutes
+      maxBlocks: 1000 # Maximum number of blocks in a segment, default is 1000
+    auditor:
+      maxInterval: 10 # Maximum interval between two auditing operations in seconds, default is 10 seconds
+      # Deadline for one compaction request to one replica, in seconds, default is 330s. Travels to
+      # the node as the gRPC deadline and is capped there by logstore.segmentCompactionPolicy.timeout,
+      # so the shorter of the two applies. This is what bounds a node that stops answering at all.
+      compactionAttemptTimeout: 330
+      # How long one auditor cycle keeps starting compactions, in seconds, default is 60s. A
+      # compaction already running is never cut off, so a cycle can overrun by one segment. Without
+      # it a cycle can spend hours draining a backlog while the log's other maintenance waits.
+      compactionPassBudget: 60
+    sessionMonitor:
+      checkInterval: 3 # How often to check session health in seconds, default is 3 seconds
+      maxFailures: 5 # Consecutive failures before marking session invalid, default is 5
+    # Direct read configuration for sealed segments in service storage mode.
+    # When enabled in service storage mode, the client reads sealed segments directly from object storage (S3/MinIO)
+    # instead of going through quorum nodes via gRPC, reducing latency and quorum node load.
+    directRead:
+      enabled: true # Whether to enable direct read from object storage for sealed segments in service storage mode, default is true
+      maxBatchSize: 16777216 # Maximum batch size in bytes for service-mode direct read operations, default is 16MB
+      maxFetchThreads: 4 # Maximum number of concurrent fetch threads for service-mode direct read, default is 4
+    # How this client dials logStores. The logStore's own gRPC settings are under logstore.grpc.
+    grpc:
+      dialTimeout: 1000 # Milliseconds allowed for one attempt to establish a connection (gRPC's MinConnectTimeout, 20s if unset). A call on a connection that is still connecting waits for the attempt, so this also bounds a call to an address that never answers, such as a replaced pod's reclaimed IP. Same meaning as Milvus's grpc.client.dialTimeout. Default 1000.
+      connectBackoff: # Delay before the next connection attempt after a failed one: starts at baseDelay, grows by multiplier with jitter, up to maxDelay. Not a call retry backoff.
+        baseDelay: 100 # Milliseconds, default 100
+        multiplier: 1.6 # Default 1.6
+        jitter: 0.2 # Default 0.2
+        maxDelay: 3000 # Milliseconds, default 3000
+    # Bounds on one quorum read call to one replica. A replica that vanished with its connection still looking healthy never answers, and until the call returns the reader cannot move on to the next replica.
+    segmentRead:
+      activeTimeout: 3000 # Milliseconds, for an active segment, served from the replica's buffer or local disk. Default 3000.
+      settledTimeout: 20000 # Milliseconds, for any other segment, which may be served from object storage (a slow answer there is the storage, and the next replica would read the same storage); also the retry bound when every replica ran out of activeTimeout. Default 20000.
+    # How often a client re-reads the operator-declared skip ranges (wp log skip-range).
+    # A reader is always answered from what the client already holds; an elapsed interval only
+    # starts a refresh behind it, so this trades staleness against etcd traffic and never makes a
+    # read slower. It bounds how often refreshes happen once a stalled reader starts asking, not the
+    # absolute age of the cached copy. Default 10.
+    skipRangeRefreshInterval: 10
+    # Advanced Quorum Configuration for Service storage backend mode
+    # This configuration supports complex node selection strategies and buffer pools
+    quorum:
+      selectNodesTimeout: 2000 # Milliseconds allowed for one SelectNodes call to a seed. New segments are created on the append path, so a seed that does not answer would stall appends; when this expires the next seed is asked. Default 2000.
+      # Quorum Buffer Pools: Define groups of nodes for different purposes
+      quorumBufferPools:
+        - name: default-region-pool # Name of the default region pool
+          seeds: [ ] # List of node addresses that can be used for quorum operations
+      # affinityMode, replicas, and strategy below can be overridden at runtime
+      # by the embedding application (via the client's Dynamic[T] source hooks);
+      # such changes take effect on the next segment and require no restart.
+      # Quorum Selection Strategy: How to select nodes for quorum operations
+      quorumSelectStrategy:
+        # Affinity Mode: How strictly to apply node selection rules
+        # - soft: Prefer rules but allow fallback if requirements can't be met
+        # - hard: Strictly enforce rules, fail if requirements can't be met
+        affinityMode: soft
+        # Number of replicas in the quorum ensemble
+        # This determines the total number of nodes in a write operation
+        # Valid values: [3,5]
+        replicas: 3
+        # Node selection strategy
+        # - random: nodes are selected randomly
+        # - single-az-single-rg: All nodes in same availability zone and resource group
+        # - single-az-multi-rg: Same availability zone, multiple resource groups
+        # - multi-az-single-rg: Multiple availability zones, single resource group
+        # - multi-az-multi-rg: Multiple availability zones and resource groups
+        # - cross-region: Nodes across different regions for maximum durability
+        # - custom: Use custom expressions defined below
+        strategy: random
+        # Custom expressions for node selection (only used when strategy is 'custom')
+        customPlacement:
+        #  - name: replica-1
+        #    region: "default-region-pool"
+        #    az: "az-1"
+        #    resourceGroup: "rg.*"
+        #  - name: replica-2
+        #    region: "default-region-pool"
+        #    az: "az-2"
+        #    resourceGroup: "rg.*"
+        #  - name: replica-3
+        #    region: "default-region-pool"
+        #    az: "az.*"
+        #    resourceGroup: "rg.*"
+  # Configuration of Woodpecker LogStore Server.
+  logstore:
+    segmentSyncPolicy:
+      maxInterval: 200 # Maximum interval between two sync operations in milliseconds
+      maxIntervalForLocalStorage: 10 # Maximum interval between sync operations for local storage backend, in milliseconds
+      maxIntervalForService: 1 # Maximum interval between sync operations for service mode, in milliseconds. Service mode also triggers sync via service-side events, so a small value (e.g. 1ms) minimizes durability latency
+      maxEntries: 10000 # Maximum entries number of write buffer
+      maxBytes: 256000000 # Maximum size of write buffer in bytes
+      maxFlushRetries: 5 # Maximum number of retries for sync operations
+      retryInterval: 1000 # Maximum interval between two retries in milliseconds
+      maxFlushSize: 2000000 # Maximum size of a block in bytes to flush, default is 2MB, which is the best practice for cloud storage
+      maxFlushThreads: 32 # Maximum number of threads to flush data
+    syncScheduler:
+      # Workers in the node's shared flush pool, as a plain count. Each one blocks in fdatasync
+      # while a flush is in flight, so this bounds concurrent syncs, not CPU usage -- a worker
+      # parked in a blocking syscall costs an OS thread, not a core.
+      # Tune from the volume's IOPS budget: workers ~= target IOPS x fsync latency. Past the point
+      # where the device saturates, more workers buy queueing rather than throughput.
+      maxWorkers: 32
+    segmentCompactionPolicy:
+      maxBytes: 2000000 # Maximum size of a merged block in bytes after compact, default is 2M
+      maxParallelUploads: 4 # Maximum number of parallel upload threads for compaction, default is 4
+      maxParallelReads: 8 # Maximum number of parallel read threads for compaction, default is 8
+      # Ceiling on how long one compaction may run on this node, in seconds, default is 300s. A node
+      # guardrail, not a per-tenant policy: one logstore serves many tenants from this one value.
+      timeout: 300
+      # Memory this node will reserve for the compactions it runs at once, across every log it
+      # serves, default is 1GB. Absolute rather than a share of the pod: useful concurrency
+      # saturates on object-storage bandwidth long before memory -- a hundred concurrent
+      # compactions is ~1.6GB here but four hundred simultaneous uploads -- so a larger pod does
+      # not need a larger allowance. Compactions beyond it are refused, not queued: the client
+      # tries the next replica and the auditor retries on a later cycle.
+      maxInflightMemory: 1000000000
+      # Stop taking on new compactions once the node's memory usage passes this fraction of its
+      # limit, whatever is using it -- the reservation above only knows about compaction. Applies
+      # only where a container memory limit can be read; on bare metal, with no limit set, or if
+      # detection fails it is skipped rather than measured against host memory.
+      memoryHighWatermark: 0.7
+    segmentReadPolicy:
+      maxBatchSize: 2000000 # Maximum size of a batch in bytes, default is 2MB
+      maxFetchThreads: 32 # Maximum number of threads to fetch data, default is 32
+    retentionPolicy:
+      ttl: 259200 # Time to live for truncated segments in seconds, default is 259200s (72 hours)
+    fencePolicy:
+      # Enable conditional write for embedded mode, default is auto, which will automatically detect whether the storage supports conditional write.
+      # Valid values: [auto, enable, disable]
+      conditionWrite: auto
+    grpc:
+      serverMaxSendSize: 536870912 # The maximum size of each RPC request that the logStore can send, unit: byte
+      serverMaxRecvSize: 268435456 # The maximum size of each RPC request that the logStore can receive, unit: byte
+      clientMaxSendSize: 268435456 # The maximum size of each RPC request that the clients on logStore can send, unit: byte
+      clientMaxRecvSize: 536870912 # The maximum size of each RPC request that the clients on logStore can receive, unit: byte
+    processorCleanupPolicy:
+      cleanupInterval: 60 # How often to scan for idle segment processors in seconds, default is 60 seconds
+      maxIdleTime: 300 # How long a processor can be idle before cleanup in seconds, default is 300 seconds
+      shutdownTimeout: 15 # Timeout for closing all processors during LogStore shutdown in seconds, default is 15 seconds
+    maintenanceStrategy:
+      deleteGracePeriod: 5 # Seconds after a log is marked deleted before local data is reclaimed. Near-real-time by default: calling the delete API means the caller has confirmed the data is no longer needed.
+      deleteReclaimInterval: 2 # How often the reclaim task scans delete markers, in seconds. Deleted data disappears within ~gracePeriod+interval of the request.
+      compactedFileCleanupInterval: 5 # Seconds; scan interval for reclaiming local staged data.log after compaction is durably confirmed in object storage.
+      reconcileMinDataLogAge: 1800 # Seconds (default 30m); the compacted-file-cleanup pull reconcile only HEADs a segment's footer once its local data.log has been idle this long (> roll interval + compaction time), avoiding wasted object-storage HEADs on segments still being written/compacted. Does not affect the push (marked) fast path. <=0 disables.
+    nodeSelectionPolicy:
+      loadAwareEnabled: true    # Prefer lower-load nodes among eligible candidates (issue #114)
+      loadReportInterval: 10    # Seconds between a node sampling its load and announcing it to the cluster over gossip
+      loadTTL: 30               # Seconds; a node's load older than this is treated as unknown. Keep it a small multiple of loadReportInterval — with 10/30 a peer must miss three consecutive announces before the load is dropped
+      memSoftThreshold: 0.85    # Memory ratio above which memory escalates the load factor
+      ewmaAlpha: 0.5            # EWMA weight on the newest load sample (0,1]
+    diskWatermarkPolicy:
+      enabled: true             # Local WAL disk watermark monitoring + backpressure (service/local storage only)
+      softThresholdRatio: 0.80  # Used ratio (used/(used+free), df semantics) above which a rate-limited WARN recommends expanding the PVC or scaling out logstore nodes
+      hardThresholdRatio: 0.90  # Used ratio above which new appends are rejected with a retriable error; set >= 1.0 (with minFreeBytes: 0) for warn-only
+      throttleEnabled: true     # Between soft and hard, reject appends with probability ramping 0%→100% (retriable); false = warn-only until hard
+      minFreeBytes: 1GB         # Absolute free-space floor; free space at or below this also blocks appends
+      sampleInterval: 10        # Seconds between disk samples
+  # Configuration of Woodpecker Storage Backend.
+  storage:
+    # The default value is "default", which configures Woodpecker to use MinIO-compatible storage.
+    # Valid values: [default, minio, local, service]
+    type: minio
+    rootPath: /var/lib/woodpecker # Root path to the log data files.
+  # Configuration of Woodpecker runtime subsystems.
+  runtime:
+    # In-flight operation registry backing `wp ops stats` and the operation metrics.
+    opRegistry:
+      capacity: 1024 # Maximum number of in-flight operations tracked, default is 1024
+      warnAge: 30 # Seconds after which a still-running operation is reported as stalled, default is 30s
+
+# Configures the system log output.
+log:
+  # Woodpecker log level. Option: debug, info, warn, error, panic, and fatal.
+  # It is recommended to use debug level under test and development environments, and info level in production environment.
+  level: info
+  file:
+    # Root path to the log files.
+    # The default value is set empty, indicating to output log files to standard output (stdout) and standard error (stderr).
+    # If this parameter is set to a valid local path, Woodpecker writes and stores log files in this path.
+    # Set this parameter as the path that you have permission to write.
+    rootPath:
+    maxSize: 300 # The maximum size of a log file, unit: MB.
+    maxAge: 10 # The maximum retention time before a log file is automatically cleared, unit: day. The minimum value is 1.
+    maxBackups: 20 # The maximum number of log files to back up, unit: day. The minimum value is 1.
+  format: text # Woodpecker log format. Option: text and JSON
+  stdout: true # Stdout enable or not
+
+# Trace configuration
+trace:
+  # trace exporter type, default is stdout,
+  # optional values: ['noop','stdout', 'jaeger', 'otlp']
+  exporter: noop
+  # fraction of traceID based sampler,
+  # optional values: [0, 1]
+  # Fractions >= 1 will always sample. Fractions < 0 are treated as zero.
+  sampleFraction: 1
+  jaeger:
+    url:  # when exporter is jaeger should set the jaeger's URL
+  otlp:
+    endpoint: 127.0.0.1:4317 # example: "127.0.0.1:4317" for grpc, "127.0.0.1:4318" for http
+    method: grpc  # otlp export method, acceptable values: ["grpc", "http"],  using "grpc" by default
+    secure: false
+  initTimeoutSeconds: 10 # segcore initialization timeout in seconds, preventing otlp grpc hangs forever
+
+# Related configuration of etcd, used to store Woodpecker metadata & service discovery.
+etcd:
+  # Endpoints used to access etcd service. You can change this parameter as the endpoints of your own etcd cluster.
+  endpoints:
+    - localhost:2379
+  # Root prefix of the key to where Woodpecker stores data in etcd.
+  # It is recommended to change this parameter before starting Woodpecker for the first time.
+  # To share an etcd instance among multiple Woodpecker instances, consider changing this to a different value for each Woodpecker instance before you start them.
+  # Set an easy-to-identify root path for Woodpecker if etcd service already exists.
+  # Changing this for an already running Woodpecker instance may result in failures to read legacy data.
+  rootPath: by-dev
+  # Sub-prefix of the key to where Woodpecker stores metadata-related information in etcd.
+  # Caution: Changing this parameter after using Woodpecker for a period of time will affect your access to old data.
+  # It is recommended to change this parameter before starting Woodpecker for the first time.
+  metaSubPath: meta
+  # Sub-prefix of the key to where Woodpecker stores timestamps in etcd.
+  # Caution: Changing this parameter after using Woodpecker for a period of time will affect your access to old data.
+  # It is recommended not to change this parameter if there is no specific reason.
+  kvSubPath: kv
+  log:
+    level: info # Only supports debug, info, warn, error, panic, or fatal. Default 'info'.
+    # path is one of:
+    #  - "default" as os.Stderr,
+    #  - "stderr" as os.Stderr,
+    #  - "stdout" as os.Stdout,
+    #  - file path to append server logs to.
+    # please adjust in embedded woodpecker: /tmp/woodpecker/logs/etcd.log
+    path: stdout
+  ssl:
+    enabled: false # Whether to support ETCD secure connection mode
+    tlsCert: /path/to/etcd-client.pem # path to your cert file
+    tlsKey: /path/to/etcd-client-key.pem # path to your key file
+    tlsCACert: /path/to/ca.pem # path to your CACert file
+    # TLS min version
+    # Optional values: 1.0, 1.1, 1.2, 1.3。
+    # We recommend using version 1.2 and above.
+    tlsMinVersion: 1.3
+  requestTimeout: 10000 # Etcd operation timeout in milliseconds
+  use:
+    embed: false # Whether to enable embedded Etcd (an in-process EtcdServer).
+  data:
+    dir: default.etcd # Embedded Etcd only. please adjust in embedded woodpecker: /tmp/woodpecker/etcdData/
+  auth:
+    enabled: false # Whether to enable authentication
+    userName:  # username for etcd authentication
+    password:  # password for etcd authentication
+
+# Related configuration of MinIO/S3/GCS or any other service supports S3 API, which is responsible for data persistence for Woodpecker.
+# We refer to the storage service as MinIO/S3 in the following description for simplicity.
+minio:
+  # IP address of MinIO or S3 service.
+  # Environment variable: MINIO_ADDRESS
+  # minio.address and minio.port together generate the valid access to MinIO or S3 service.
+  # MinIO preferentially acquires the valid IP address from the environment variable MINIO_ADDRESS when Woodpecker is started.
+  # Default value applies when MinIO or S3 is running on the same network with Woodpecker.
+  address: localhost
+  port: 9000 # Port of MinIO or S3 service.
+  # Access key ID that MinIO or S3 issues to user for authorized access.
+  # Environment variable: MINIO_ACCESS_KEY_ID or minio.accessKeyID
+  # minio.accessKeyID and minio.secretAccessKey together are used for identity authentication to access the MinIO or S3 service.
+  # This configuration must be set identical to the environment variable MINIO_ACCESS_KEY_ID, which is necessary for starting MinIO or S3.
+  # The default value applies to MinIO or S3 service that started with the default docker-compose.yml file.
+  accessKeyID: minioadmin
+  # Secret key used to encrypt the signature string and verify the signature string on server. It must be kept strictly confidential and accessible only to the MinIO or S3 server and users.
+  # Environment variable: MINIO_SECRET_ACCESS_KEY or minio.secretAccessKey
+  # minio.accessKeyID and minio.secretAccessKey together are used for identity authentication to access the MinIO or S3 service.
+  # This configuration must be set identical to the environment variable MINIO_SECRET_ACCESS_KEY, which is necessary for starting MinIO or S3.
+  # The default value applies to MinIO or S3 service that started with the default docker-compose.yml file.
+  secretAccessKey: minioadmin
+  useSSL: false # Switch value to control if to access the MinIO or S3 service through SSL.
+  ssl:
+    tlsCACert: /path/to/public.crt # path to your CACert file
+  # Name of the bucket where Woodpecker stores data in MinIO or S3.
+  # Woodpecker does not support storing data in multiple buckets.
+  # When createBucket is true, a bucket with this name is created at startup if it does not exist.
+  # When createBucket is false, Woodpecker neither checks nor creates the bucket; it must be pre-provisioned.
+  # To share an MinIO instance among multiple Woodpecker instances, consider changing this to a different value for each Woodpecker instance before you start them.
+  # The data will be stored in the local Docker if Docker is used to start the MinIO service locally. Ensure that there is sufficient storage space.
+  # A bucket name is globally unique in one MinIO or S3 instance.
+  bucketName: a-bucket
+  # Whether Woodpecker manages the bucket above at startup.
+  # true:  check the bucket and create it if missing (single-tenant / embed default).
+  # false: skip the bucket check and creation entirely — use when the bucket is pre-provisioned and
+  #        managed by the caller, e.g. service (multi-tenant) mode where bucket/rootPath arrive
+  #        per-request, so startup does not depend on any specific bucket.
+  createBucket: true
+  # Root prefix of the key to where Woodpecker stores data in MinIO or S3.
+  # It is recommended to change this parameter before starting Woodpecker for the first time.
+  # To share an MinIO instance among multiple Woodpecker instances, consider changing this to a different value for each Woodpecker instance before you start them.
+  # Set an easy-to-identify root key prefix for Woodpecker if etcd service already exists.
+  # Changing this for an already running Woodpecker instance may result in failures to read legacy data.
+  rootPath: files
+  # Whether to useIAM role to access S3/GCS instead of access/secret keys
+  # For more information, refer to
+  # aws: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use.html
+  # gcp: https://cloud.google.com/storage/docs/access-control/iam
+  # aliyun (ack): https://www.alibabacloud.com/help/en/container-service-for-kubernetes/latest/use-rrsa-to-enforce-access-control
+  # aliyun (ecs): https://www.alibabacloud.com/help/en/elastic-compute-service/latest/attach-an-instance-ram-role
+  useIAM: false
+  # Cloud Provider of S3. Supports: "aws", "gcp", "aliyun".
+  # Cloud Provider of Google Cloud Storage. Supports: "gcpnative".
+  # You can use "aws" for other cloud provider supports S3 API with signature v4, e.g.: minio
+  # You can use "gcp" for other cloud provider supports S3 API with signature v2
+  # You can use "aliyun" for other cloud provider uses virtual host style bucket
+  # You can use "gcpnative" for the Google Cloud Platform provider. Uses service account credentials
+  # for authentication.
+  # When useIAM enabled, only "aws", "gcp", "aliyun" is supported for now
+  cloudProvider: aws
+  # The JSON content contains the gcs service account credentials.
+  # Used only for the "gcpnative" cloud provider.
+  gcpCredentialJSON:
+  # Custom endpoint for fetch IAM role credentials. when useIAM is true & cloudProvider is "aws".
+  # Leave it empty if you want to use AWS default endpoint
+  iamEndpoint:
+  logLevel: fatal # Log level for aws sdk log. Supported level:  off, fatal, error, warn, info, debug, trace
+  region:  # Specify minio storage system location region
+  useVirtualHost: false # Whether use virtual host mode for bucket
+  requestTimeoutMs: 10000 # minio timeout for request time in milliseconds
+  # The maximum number of objects requested per batch in minio ListObjects rpc,
+  # 0 means using oss client by default, decrease these configration if ListObjects timeout
+  listObjectsMaxKeys: 0

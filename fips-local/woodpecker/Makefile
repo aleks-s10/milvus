@@ -1,0 +1,215 @@
+BIN_DIR := $(PWD)/bin
+PROTOC_GEN_GO_VERSION := v1.36.2
+PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
+PROTOC_GEN_GO_VTPROTO_VERSION := v0.6.0
+
+# Version info injected via -ldflags at build time.
+# Consumed by github.com/zilliztech/woodpecker/common/version.
+VERSION_PKG := github.com/zilliztech/woodpecker/common/version
+VERSION     := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_TIME  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS     := -ldflags "-s -w \
+                -X '$(VERSION_PKG).Version=$(VERSION)' \
+                -X '$(VERSION_PKG).Commit=$(COMMIT)' \
+                -X '$(VERSION_PKG).BuildTime=$(BUILD_TIME)'"
+
+# Default target - show help
+.DEFAULT_GOAL := help
+
+.PHONY: help
+help: ## Show this help message
+	@echo "🚀 Woodpecker Build System"
+	@echo "=========================="
+	@echo ""
+	@echo "Available targets:"
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo ""
+	@echo "💡 For more advanced builds, use:"
+	@echo "   ./build/build_bin.sh --help     # Binary builds"
+	@echo "   ./build/build_image.sh --help   # Docker builds"
+	@echo "   ./deployments/deploy.sh help    # Cluster management"
+
+$(BIN_DIR):
+	@mkdir -p $(BIN_DIR)
+
+# Install protoc-gen-go
+$(BIN_DIR)/protoc-gen-go: | $(BIN_DIR)
+	@echo "Installing protoc-gen-go..."
+	@GOBIN=$(BIN_DIR) go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+
+# Install protoc-gen-go-grpc
+$(BIN_DIR)/protoc-gen-go-grpc: | $(BIN_DIR)
+	@echo "Installing protoc-gen-go-grpc..."
+	@GOBIN=$(BIN_DIR) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+
+# Install protoc-gen-go-vtproto
+$(BIN_DIR)/protoc-gen-go-vtproto: | $(BIN_DIR)
+	@echo "Installing protoc-gen-go-vtproto..."
+	@GOBIN=$(BIN_DIR) go install github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto@$(PROTOC_GEN_GO_VTPROTO_VERSION)
+
+# Install all tools
+.PHONY: install
+install: $(PROTOC_DIR) $(BIN_DIR)/protoc-gen-go $(BIN_DIR)/protoc-gen-go-grpc $(BIN_DIR)/protoc-gen-go-vtproto ## Install all protobuf tools
+	@echo "All tools installed in $(BIN_DIR)."
+
+.PHONY: proto
+proto: ## Generate protobuf code
+	cd proto && \
+	protoc \
+		--go_out=. \
+		--go_opt paths=source_relative \
+		--plugin protoc-gen-go="${BIN_DIR}/protoc-gen-go" \
+		--go-grpc_out=. \
+		--go-grpc_opt require_unimplemented_servers=false,paths=source_relative \
+		--plugin protoc-gen-go-grpc="${BIN_DIR}/protoc-gen-go-grpc" \
+		--go-vtproto_out=. \
+		--go-vtproto_opt paths=source_relative \
+		--plugin protoc-gen-go-vtproto="${BIN_DIR}/protoc-gen-go-vtproto" \
+		--go-vtproto_opt=features=marshal+unmarshal+unmarshal_unsafe+size+pool+equal+clone \
+		*.proto
+
+proto_clean:
+	rm -f */*.pb.go
+
+.PHONY: build
+build: ## Build binary for current platform
+	go build -v -o bin/woodpecker ./cmd
+
+.PHONY: wpcli
+wpcli: | $(BIN_DIR) ## Build wp CLI binary (outputs bin/wp)
+	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BIN_DIR)/wp ./cmd/wpcli
+	@echo "Built $(BIN_DIR)/wp"
+
+WPCLI_PLATFORMS ?= linux/amd64 linux/arm64 darwin/arm64 windows/amd64
+
+.PHONY: wpcli-release
+wpcli-release: | $(BIN_DIR) ## Build wp CLI for all release platforms
+	@for platform in $(WPCLI_PLATFORMS); do \
+		os=$${platform%%/*}; arch=$${platform##*/}; \
+		ext=""; if [ "$$os" = "windows" ]; then ext=".exe"; fi; \
+		echo "Building wp-$$os-$$arch$$ext ..."; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build $(LDFLAGS) \
+			-o $(BIN_DIR)/wp-$$os-$$arch$$ext \
+			./cmd/wpcli; \
+	done
+	@echo "Release binaries in $(BIN_DIR):"
+	@ls -1 $(BIN_DIR)/wp-*
+
+test: build ## Run all tests
+	go test -cover -race ./...
+
+.PHONY: lint
+lint: ## Run golangci-lint
+	golangci-lint run --config .golangci.yml ./...
+
+.PHONY: lint-fix
+lint-fix: ## Run golangci-lint with auto-fix
+	golangci-lint run --config .golangci.yml --fix ./...
+
+.PHONY: fmt
+fmt: ## Format code with gofumpt and gci
+	gofumpt -l -w .
+	gci write . --section standard --section default --section "prefix(github.com/zilliztech/woodpecker)" --skip-generated
+
+.PHONY: fmt-check
+fmt-check: ## Check code formatting (CI)
+	@echo "Checking gofumpt..."
+	@test -z "$$(gofumpt -l .)" || (echo "Files need formatting:"; gofumpt -l .; exit 1)
+	@echo "Checking gci..."
+	@gci diff . --section standard --section default --section "prefix(github.com/zilliztech/woodpecker)" --skip-generated | tee /dev/stderr | (! grep .)
+	@echo "All files formatted correctly."
+
+.PHONY: unit-test
+unit-test: ## Run unit tests only (excludes integration/benchmark/stability/docker/k8s)
+	go test -race -short -cover -coverprofile=coverage.out -covermode=atomic -failfast -timeout=20m \
+		$$(go list ./... | grep -v -E '(tests/integration|tests/benchmark|tests/stability|tests/docker|tests/k8s)')
+
+.PHONY: integration-test
+integration-test: ## Run all integration tests (requires etcd + MinIO)
+	go test -race -cover -failfast -timeout=45m -v ./tests/integration/...
+
+.PHONY: integration-test-e2e-local
+integration-test-e2e-local: ## Run e2e tests with local filesystem storage
+	go test -race -cover -failfast -timeout=20m -v \
+		-run "/LocalFsStorage" \
+		./tests/integration/...
+
+.PHONY: integration-test-e2e-objectstorage
+integration-test-e2e-objectstorage: ## Run e2e tests with object storage (MinIO)
+	go test -race -cover -failfast -timeout=20m -v \
+		-run "/ObjectStorage" \
+		./tests/integration/...
+
+.PHONY: integration-test-e2e-service
+integration-test-e2e-service: ## Run e2e tests with service storage + failover
+	go test -race -cover -failfast -timeout=25m -v \
+		-run "/ServiceStorage" \
+		./tests/integration/...
+	go test -race -cover -failfast -timeout=25m -v \
+		-run "^TestStagedStorageService" \
+		./tests/integration/...
+
+.PHONY: integration-test-service-stability-process
+integration-test-service-stability-process: ## Service stability, process tier (requires etcd + MinIO; latency budgets, so no -race)
+	go test -cover -timeout=30m -v \
+		-run "^TestServiceStabilityProcess" \
+		./tests/integration/...
+
+.PHONY: integration-test-service-stability-docker
+integration-test-service-stability-docker: ## Service stability, Docker tier (builds the image and starts a 4-node compose cluster)
+	./tests/docker/stability/run_service_stability.sh
+
+.PHONY: integration-test-service-stability-k8s
+integration-test-service-stability-k8s: ## Service stability, K8s tier (minikube + operator + Chaos Mesh; nightly)
+	./tests/k8s/stability/run_service_stability.sh
+
+.PHONY: integration-test-components
+integration-test-components: ## Run component integration tests (non-e2e)
+	go test -race -cover -failfast -timeout=20m -v \
+		-skip "^(TestOpenWriter|TestOpenInternal|TestRepeated|TestWriterClose|TestClientRecreation|TestMultiClient|TestConcurrentWriteAnd|TestConcurrentReader|TestReadTheWritten|TestReadWriteLoop|TestMultiAppendSync|TestTailRead|TestConcurrentWriteWith|TestTruncate|TestWriteAndTruncate|TestMultiSegment|TestReadBefore|TestSegmentCleanup|TestStagedStorageService|TestServiceStability)" \
+		./tests/integration/...
+
+clean: ## Clean built binaries
+	rm -f $(BIN_DIR)/*
+
+# Docker targets (using new build system)
+docker: ## Build Docker image (auto-detect architecture)
+	./build/build_image.sh ubuntu22.04 auto -t woodpecker:latest
+
+# Multi-architecture Docker build
+docker-multiarch: ## Build multi-architecture Docker image
+	./build/build_image.sh ubuntu22.04 multiarch -t woodpecker:latest
+
+# Build binary for Linux (basic build commands)
+build-linux: ## Build Linux binary (AMD64)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o bin/woodpecker ./cmd
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/wp ./cmd/wpcli
+
+# Build binary for Linux ARM64
+build-linux-arm64: ## Build Linux binary (ARM64)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -v -o bin/woodpecker ./cmd
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o bin/wp ./cmd/wpcli
+
+# Auto-detect architecture build (using new build system)
+build-auto: ## Build binary (auto-detect architecture)
+	./build/build_bin.sh auto
+
+# Cluster management (delegated to deploy.sh for consistency)
+cluster-up: ## Start the complete cluster
+	cd deployments && ./deploy.sh up
+
+cluster-down: ## Stop the cluster
+	cd deployments && ./deploy.sh down
+
+cluster-clean: ## Stop cluster and remove volumes
+	cd deployments && ./deploy.sh clean
+
+cluster-logs: ## View cluster logs
+	cd deployments && ./deploy.sh logs
+
+cluster-status: ## Check cluster status
+	cd deployments && ./deploy.sh status
+
+cluster-test: ## Test cluster connectivity
+	cd deployments && ./deploy.sh test

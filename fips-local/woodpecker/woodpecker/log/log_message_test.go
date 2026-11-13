@@ -1,0 +1,518 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package log
+
+import (
+	"math"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/zilliztech/woodpecker/common/werr"
+	pb "github.com/zilliztech/woodpecker/proto"
+)
+
+func TestValidateMsg(t *testing.T) {
+	t.Run("NilMessage", func(t *testing.T) {
+		err := ValidateMsg(nil)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "message is nil")
+	})
+
+	t.Run("ValidPayloadOnly", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("test data"),
+			Properties: nil,
+		}
+		err := ValidateMsg(msg)
+		require.NoError(t, err)
+	})
+
+	t.Run("ValidPropertiesOnly", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    nil,
+			Properties: map[string]string{"key": "value"},
+		}
+		err := ValidateMsg(msg)
+		require.NoError(t, err)
+	})
+
+	t.Run("ValidPayloadAndProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("test data"),
+			Properties: map[string]string{"key": "value"},
+		}
+		err := ValidateMsg(msg)
+		require.NoError(t, err)
+	})
+
+	t.Run("EmptyPayloadWithProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte{},
+			Properties: map[string]string{"key": "value"},
+		}
+		err := ValidateMsg(msg)
+		require.NoError(t, err)
+	})
+
+	t.Run("PayloadWithEmptyProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("test data"),
+			Properties: map[string]string{},
+		}
+		err := ValidateMsg(msg)
+		require.NoError(t, err)
+	})
+
+	t.Run("BothNilPayloadAndProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    nil,
+			Properties: nil,
+		}
+		err := ValidateMsg(msg)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "can not set Properties and Payload both")
+	})
+
+	t.Run("BothEmptyPayloadAndProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte{},
+			Properties: map[string]string{},
+		}
+		err := ValidateMsg(msg)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "can not set Properties and Payload both")
+	})
+
+	t.Run("NilPayloadWithEmptyProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    nil,
+			Properties: map[string]string{},
+		}
+		err := ValidateMsg(msg)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "can not set Properties and Payload both")
+	})
+
+	t.Run("EmptyPayloadWithNilProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte{},
+			Properties: nil,
+		}
+		err := ValidateMsg(msg)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "can not set Properties and Payload both")
+	})
+}
+
+func TestMarshalMessage(t *testing.T) {
+	t.Run("ValidPayload", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("valid test data"),
+			Properties: map[string]string{"key": "value"},
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), 0)
+
+		// Verify we can unmarshal it back
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		assert.Equal(t, msg.Payload, layout.Payload)
+		assert.Equal(t, msg.Properties, layout.Properties)
+	})
+
+	t.Run("NilMessage", func(t *testing.T) {
+		_, err := MarshalMessage(nil)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "message is nil")
+	})
+
+	t.Run("BothEmptyPayloadAndProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte{},
+			Properties: map[string]string{},
+		}
+
+		_, err := MarshalMessage(msg)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "can not set Properties and Payload both")
+	})
+
+	t.Run("BothNilPayloadAndProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    nil,
+			Properties: nil,
+		}
+
+		_, err := MarshalMessage(msg)
+		require.Error(t, err)
+		assert.True(t, werr.ErrInvalidMessage.Is(err), "Error should be ErrInvalidMessage")
+		assert.Contains(t, err.Error(), "can not set Properties and Payload both")
+	})
+
+	t.Run("SingleBytePayload", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("a"),
+			Properties: map[string]string{"key": "value"},
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), 0)
+
+		// Verify content
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("a"), layout.Payload)
+		assert.Equal(t, msg.Properties, layout.Properties)
+	})
+
+	t.Run("LargePayload", func(t *testing.T) {
+		largeData := make([]byte, 1024*1024) // 1MB
+		for i := range largeData {
+			largeData[i] = byte(i % 256)
+		}
+
+		msg := &WriteMessage{
+			Payload:    largeData,
+			Properties: map[string]string{"size": "1MB"},
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), len(largeData))
+
+		// Verify content
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		assert.Equal(t, largeData, layout.Payload)
+	})
+
+	t.Run("OnlyPayload", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("test data without properties"),
+			Properties: nil,
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), 0)
+
+		// Verify content
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		assert.Equal(t, msg.Payload, layout.Payload)
+		assert.Nil(t, layout.Properties)
+	})
+
+	t.Run("OnlyProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    nil,
+			Properties: map[string]string{"key": "value"},
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), 0)
+
+		// Verify content
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		assert.Nil(t, layout.Payload)
+		assert.Equal(t, msg.Properties, layout.Properties)
+	})
+
+	t.Run("EmptyPayloadWithProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte{},
+			Properties: map[string]string{"key": "value"},
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), 0)
+
+		// Verify content
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		// Empty byte slice becomes nil after protobuf serialization/deserialization
+		if layout.Payload == nil {
+			assert.Nil(t, layout.Payload)
+		} else {
+			assert.Equal(t, []byte{}, layout.Payload)
+		}
+		assert.Equal(t, msg.Properties, layout.Properties)
+	})
+
+	t.Run("PayloadWithEmptyProperties", func(t *testing.T) {
+		msg := &WriteMessage{
+			Payload:    []byte("test data with empty properties"),
+			Properties: map[string]string{},
+		}
+
+		data, err := MarshalMessage(msg)
+		require.NoError(t, err)
+		assert.Greater(t, len(data), 0)
+
+		// Verify content
+		layout := &pb.LogMessageLayout{}
+		err = proto.Unmarshal(data, layout)
+		require.NoError(t, err)
+		assert.Equal(t, msg.Payload, layout.Payload)
+		// Empty map becomes nil after protobuf serialization/deserialization
+		if layout.Properties == nil {
+			assert.Nil(t, layout.Properties)
+		} else {
+			assert.Equal(t, map[string]string{}, layout.Properties)
+		}
+	})
+}
+
+func TestUnmarshalMessage(t *testing.T) {
+	t.Run("ValidData", func(t *testing.T) {
+		originalMsg := &WriteMessage{
+			Payload:    []byte("test unmarshal data"),
+			Properties: map[string]string{"test": "unmarshal"},
+		}
+
+		// Marshal first
+		data, err := MarshalMessage(originalMsg)
+		require.NoError(t, err)
+
+		// Then unmarshal
+		msg, err := UnmarshalMessage(data)
+		require.NoError(t, err)
+		assert.Equal(t, originalMsg.Payload, msg.Payload)
+		assert.Equal(t, originalMsg.Properties, msg.Properties)
+	})
+
+	t.Run("InvalidData", func(t *testing.T) {
+		invalidData := []byte("this is not valid protobuf data")
+
+		_, err := UnmarshalMessage(invalidData)
+		require.Error(t, err)
+	})
+
+	t.Run("EmptyData", func(t *testing.T) {
+		// Empty data should fail to unmarshal as it's not valid protobuf
+		_, err := UnmarshalMessage([]byte{})
+		if err == nil {
+			// If protobuf accepts empty data, that's OK too
+			t.Skip("Protobuf accepts empty data")
+		}
+	})
+
+	t.Run("NilData", func(t *testing.T) {
+		// Nil data should fail to unmarshal as it's not valid protobuf
+		_, err := UnmarshalMessage(nil)
+		if err == nil {
+			// If protobuf accepts nil data, that's OK too
+			t.Skip("Protobuf accepts nil data")
+		}
+	})
+}
+
+func TestSerializeLogMessageId(t *testing.T) {
+	t.Run("BasicSerializeDeserialize", func(t *testing.T) {
+		id := &LogMessageId{
+			SegmentId: 42,
+			EntryId:   100,
+		}
+		data := id.Serialize()
+		require.NotNil(t, data)
+		assert.Greater(t, len(data), 0)
+
+		deserialized, err := DeserializeLogMessageId(data)
+		require.NoError(t, err)
+		assert.Equal(t, id.SegmentId, deserialized.SegmentId)
+		assert.Equal(t, id.EntryId, deserialized.EntryId)
+	})
+
+	t.Run("ZeroValues", func(t *testing.T) {
+		id := &LogMessageId{
+			SegmentId: 0,
+			EntryId:   0,
+		}
+		data := id.Serialize()
+		require.NotNil(t, data)
+
+		deserialized, err := DeserializeLogMessageId(data)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), deserialized.SegmentId)
+		assert.Equal(t, int64(0), deserialized.EntryId)
+	})
+
+	t.Run("LargeValues", func(t *testing.T) {
+		id := &LogMessageId{
+			SegmentId: 9223372036854775807, // max int64
+			EntryId:   9223372036854775807,
+		}
+		data := id.Serialize()
+		require.NotNil(t, data)
+
+		deserialized, err := DeserializeLogMessageId(data)
+		require.NoError(t, err)
+		assert.Equal(t, id.SegmentId, deserialized.SegmentId)
+		assert.Equal(t, id.EntryId, deserialized.EntryId)
+	})
+
+	t.Run("NegativeValues", func(t *testing.T) {
+		id := &LogMessageId{
+			SegmentId: -1,
+			EntryId:   -1,
+		}
+		data := id.Serialize()
+		require.NotNil(t, data)
+
+		deserialized, err := DeserializeLogMessageId(data)
+		require.NoError(t, err)
+		assert.Equal(t, int64(-1), deserialized.SegmentId)
+		assert.Equal(t, int64(-1), deserialized.EntryId)
+	})
+}
+
+func TestDeserializeLogMessageId_InvalidData(t *testing.T) {
+	t.Run("InvalidProtobuf", func(t *testing.T) {
+		invalidData := []byte("not valid protobuf")
+		_, err := DeserializeLogMessageId(invalidData)
+		require.Error(t, err)
+	})
+
+	t.Run("EmptyData", func(t *testing.T) {
+		// Empty data is valid protobuf (zero values), so this may succeed
+		result, err := DeserializeLogMessageId([]byte{})
+		if err == nil {
+			assert.Equal(t, int64(0), result.SegmentId)
+			assert.Equal(t, int64(0), result.EntryId)
+		}
+	})
+
+	t.Run("NilData", func(t *testing.T) {
+		result, err := DeserializeLogMessageId(nil)
+		if err == nil {
+			assert.Equal(t, int64(0), result.SegmentId)
+			assert.Equal(t, int64(0), result.EntryId)
+		}
+	})
+}
+
+func TestLatestLogMessageID(t *testing.T) {
+	latest := LatestLogMessageID()
+	assert.Equal(t, int64(math.MaxInt64), latest.SegmentId)
+	assert.Equal(t, int64(math.MaxInt64), latest.EntryId)
+}
+
+func TestEarliestLogMessageID(t *testing.T) {
+	earliest := EarliestLogMessageID()
+	assert.Equal(t, int64(0), earliest.SegmentId)
+	assert.Equal(t, int64(0), earliest.EntryId)
+}
+
+func TestSerializeRoundTrip(t *testing.T) {
+	// Test multiple IDs round-trip
+	ids := []*LogMessageId{
+		{SegmentId: 0, EntryId: 0},
+		{SegmentId: 1, EntryId: 42},
+		{SegmentId: 999, EntryId: 12345},
+		{SegmentId: -1, EntryId: -1},
+	}
+	for _, id := range ids {
+		data := id.Serialize()
+		deserialized, err := DeserializeLogMessageId(data)
+		require.NoError(t, err)
+		assert.Equal(t, id.SegmentId, deserialized.SegmentId)
+		assert.Equal(t, id.EntryId, deserialized.EntryId)
+	}
+}
+
+func BenchmarkMarshalMessage(b *testing.B) {
+	testCases := []struct {
+		name string
+		msg  *WriteMessage
+	}{
+		{
+			"Small",
+			&WriteMessage{
+				Payload:    []byte("small test data"),
+				Properties: map[string]string{"key": "value"},
+			},
+		},
+		{
+			"Medium",
+			&WriteMessage{
+				Payload:    make([]byte, 1024), // 1KB
+				Properties: map[string]string{"size": "1KB"},
+			},
+		},
+		{
+			"Large",
+			&WriteMessage{
+				Payload:    make([]byte, 64*1024), // 64KB
+				Properties: map[string]string{"size": "64KB"},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := MarshalMessage(tc.msg)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkUnmarshalMessage(b *testing.B) {
+	// Prepare test data
+	msg := &WriteMessage{
+		Payload:    []byte("benchmark test data for unmarshaling"),
+		Properties: map[string]string{"benchmark": "unmarshal"},
+	}
+	data, err := MarshalMessage(msg)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := UnmarshalMessage(data)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

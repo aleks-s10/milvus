@@ -90,6 +90,12 @@ ifeq ($(MILVUS_FIPS_ENABLED),ON)
 	GOEXPERIMENT_FLAG := GOEXPERIMENT=boringcrypto
 endif
 
+# Local FIPS integration only: MILVUS_NO_EMBED_ETCD=ON builds without the
+# embedded etcd server (requires external etcd).
+ifeq ($(MILVUS_NO_EMBED_ETCD),ON)
+	MILVUS_GO_BUILD_TAGS := $(MILVUS_GO_BUILD_TAGS),noembedetcd
+endif
+
 # FIPS strict: default OFF. Set MILVUS_FIPS_STRICT=ON (with MILVUS_FIPS_ENABLED=ON)
 # to also restrict Go TLS to FIPS settings, use the CMVP-validated OpenSSL FIPS
 # provider, not load OpenSSL's default provider, refuse to start without FIPS, and

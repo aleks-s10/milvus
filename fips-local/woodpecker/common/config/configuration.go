@@ -1,0 +1,1297 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"fmt"
+	"os"
+	"path"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// MetaConfig stores the metadata storage configuration.
+type MetaConfig struct {
+	Type   string `yaml:"type"`
+	Prefix string `yaml:"prefix"`
+}
+
+// SegmentRollingPolicyConfig stores the segment rolling policy configuration.
+type SegmentRollingPolicyConfig struct {
+	MaxSize     ByteSize        `yaml:"maxSize"`
+	MaxInterval DurationSeconds `yaml:"maxInterval"`
+	MaxBlocks   int64           `yaml:"maxBlocks"`
+}
+
+type SegmentAppendConfig struct {
+	QueueSize  int `yaml:"queueSize"`
+	MaxRetries int `yaml:"maxRetries"`
+	// MaxBatchEntries is the maximum number of consecutive append ops coalesced
+	// into a single AddEntries request (client-side group commit). The batch is
+	// opportunistic: it only coalesces ops already waiting in the queue, so it
+	// adds no latency at low load. Enabled by default (see the default config);
+	// set to <= 1 to disable batching and send one AddEntry per append.
+	MaxBatchEntries int `yaml:"maxBatchEntries"`
+	// MaxBatchBytes caps the total payload of a coalesced batch (whichever of
+	// MaxBatchEntries / MaxBatchBytes is reached first bounds the batch).
+	// 0 = no byte limit. Ignored when MaxBatchEntries <= 1.
+	MaxBatchBytes ByteSize `yaml:"maxBatchBytes"`
+	// SendTimeout bounds sending an append to one replica: opening the stream
+	// and receiving the replica's first (buffered) response. The send runs on
+	// the segment's executor, so every later append of the log waits while it
+	// does. Buffering an entry takes milliseconds; a replica that has not
+	// answered by then is taken as unreachable, so the segment can roll away
+	// from it. Zero means the default, 2s.
+	SendTimeout DurationMilliseconds `yaml:"sendTimeout"`
+}
+
+// DirectReadConfig stores the direct read configuration for sealed segments.
+// When enabled in service mode, the client reads sealed segments directly from
+// object storage instead of going through quorum nodes via gRPC.
+type DirectReadConfig struct {
+	Enabled         bool     `yaml:"enabled"`         // default: false
+	MaxBatchSize    ByteSize `yaml:"maxBatchSize"`    // default: 16MB
+	MaxFetchThreads int      `yaml:"maxFetchThreads"` // default: 4
+}
+
+// SegmentReadConfig bounds one quorum read call to one replica. A read that
+// gets no answer is most often a replica that vanished with its connection
+// still looking healthy, and until the call returns the reader cannot move on
+// to the next replica.
+type SegmentReadConfig struct {
+	// ActiveTimeout applies to an active segment, served from the replica's
+	// memory buffer or local disk, so it is short. Zero means the default, 3s.
+	ActiveTimeout DurationMilliseconds `yaml:"activeTimeout"`
+	// SettledTimeout applies to any other segment, which may be served from
+	// object storage, where one request alone may take up to its own timeout
+	// (minio.requestTimeoutMs). A slow answer there is the storage rather than
+	// the replica, and the next replica would read the same storage, so it is
+	// long. It is also the retry bound when every replica ran out of the active
+	// bound, in case the segment was no longer active. Zero means the default,
+	// 20s.
+	SettledTimeout DurationMilliseconds `yaml:"settledTimeout"`
+}
+
+// ClientConfig stores the client configuration.
+type ClientConfig struct {
+	SegmentAppend        SegmentAppendConfig        `yaml:"segmentAppend"`
+	SegmentRollingPolicy SegmentRollingPolicyConfig `yaml:"segmentRollingPolicy"`
+	Auditor              AuditorConfig              `yaml:"auditor"`
+	Quorum               QuorumConfig               `yaml:"quorum"`
+	SessionMonitor       SessionMonitorConfig       `yaml:"sessionMonitor"`
+	DirectRead           DirectReadConfig           `yaml:"directRead"`
+	// GRPC is how the client dials logstores. The logstore's own gRPC settings
+	// are under logstore.grpc: each process reads its own section.
+	GRPC        GRPCClientConfig  `yaml:"grpc"`
+	SegmentRead SegmentReadConfig `yaml:"segmentRead"`
+	// SkipRangeRefreshInterval is how often a client re-reads the operator-declared skip ranges once
+	// a stalled reader starts asking for them. The refresh is triggered only by such an ask when the
+	// held copy is older than this interval, and that same ask is still answered from the held copy,
+	// so this bounds how often refreshes happen -- not the absolute age of the copy. If no reader has
+	// stalled for a long time the copy is correspondingly old.
+	//
+	// A reader asks for the ranges only while it is stalled and only on its report tick, so how soon
+	// a newly declared range takes effect is set by that tick, not by this interval. A cold cache
+	// answers empty on the first ask and only starts a refresh behind the caller, so a lone reader
+	// sees a new range on its following tick.
+	//
+	// The read never waits for the refresh: a reader is always answered from what the client already
+	// holds. So this trades staleness against etcd traffic and nothing else -- shortening it does not
+	// make a read slower, and lengthening it does not make one faster. Zero leaves it at the default,
+	// 10s.
+	SkipRangeRefreshInterval DurationSeconds `yaml:"skipRangeRefreshInterval"`
+}
+
+// DefaultSkipRangeRefreshInterval is used when skipRangeRefreshInterval is unset. Ten seconds is
+// chosen for the operator, not the reader: it is short enough that someone who has just declared a
+// range sees readers move while they are still watching, and the cost of it being short is one
+// shared etcd read per interval per client, whatever the number of readers.
+const DefaultSkipRangeRefreshInterval = 10 * time.Second
+
+// GetSkipRangeRefreshInterval returns the configured interval, or the default when unset.
+func (c *ClientConfig) GetSkipRangeRefreshInterval() time.Duration {
+	if d := c.SkipRangeRefreshInterval.Duration.Duration(); d > 0 {
+		return d
+	}
+	return DefaultSkipRangeRefreshInterval
+}
+
+type AuditorConfig struct {
+	MaxInterval DurationSeconds `yaml:"maxInterval"`
+	// CompactionAttemptTimeout is how long this client waits for one node to answer one
+	// compaction request. It travels as the gRPC deadline and the node caps it with its own
+	// segmentCompactionPolicy.timeout, so the shorter applies. The two are separate because a
+	// node serves many tenants from one configuration: its ceiling is the node's, this is the
+	// tenant's.
+	//
+	// It is the only bound that survives a node that stops answering at all -- the node's
+	// ceiling is enforced by the node, and the auditor's context carries no deadline of its own.
+	// Setting it below the node's ceiling is legal, but nothing of an abandoned attempt is kept,
+	// so a value below what compaction needs makes every attempt futile.
+	CompactionAttemptTimeout DurationSeconds `yaml:"compactionAttemptTimeout"`
+	// CompactionPassBudget bounds how long one auditor cycle spends starting compactions. The
+	// auditor runs its passes in sequence, so an unbounded one stalls that log's truncate state,
+	// snapshot publication and orphan sweep for as long as it lasts.
+	//
+	// It is a budget, not a deadline: once spent no further segment is started, but one already
+	// in flight runs to completion, so a pass lasts at most this plus one segment. Cancelling in
+	// flight would cut off a segment that legitimately takes longer, on every cycle, so it would
+	// never finish. Segments not started are picked up on a later cycle.
+	CompactionPassBudget DurationSeconds `yaml:"compactionPassBudget"`
+}
+
+// SessionMonitorConfig stores the session monitor configuration for writer lock health checking.
+type SessionMonitorConfig struct {
+	CheckInterval DurationSeconds `yaml:"checkInterval"` // How often to check session health
+	MaxFailures   int             `yaml:"maxFailures"`   // Consecutive failures before marking session invalid
+}
+
+// QuorumBufferPool stores the quorum buffer pool configuration.
+type QuorumBufferPool struct {
+	Name  string   `yaml:"name"`
+	Seeds []string `yaml:"seeds"`
+}
+
+// CustomPlacement stores the custom node placement for a specific replica.
+type CustomPlacement struct {
+	Name          string `yaml:"name"`
+	Region        string `yaml:"region"`
+	Az            string `yaml:"az"`
+	ResourceGroup string `yaml:"resourceGroup"`
+}
+
+// QuorumSelectStrategy stores the quorum selection strategy configuration.
+type QuorumSelectStrategy struct {
+	AffinityMode    Dynamic[string]            `yaml:"affinityMode"`
+	Replicas        Dynamic[int]               `yaml:"replicas"`
+	Strategy        Dynamic[string]            `yaml:"strategy"`
+	CustomPlacement Dynamic[[]CustomPlacement] `yaml:"customPlacement"`
+}
+
+// QuorumConfig stores the advanced quorum configuration.
+type QuorumConfig struct {
+	BufferPools    Dynamic[[]QuorumBufferPool] `yaml:"quorumBufferPools"`
+	SelectStrategy QuorumSelectStrategy        `yaml:"quorumSelectStrategy"`
+	// SelectNodesTimeout bounds one SelectNodes call to a seed. New segments are
+	// created on the append path, so a seed that does not answer would stall
+	// appends; when this expires the next seed is asked. Zero means the
+	// default, 2s.
+	SelectNodesTimeout DurationMilliseconds `yaml:"selectNodesTimeout"`
+}
+
+// GetEnsembleSize returns the ensemble size.
+func (q *QuorumConfig) GetEnsembleSize() int {
+	switch q.SelectStrategy.Replicas.Get() {
+	case 3:
+		return 3
+	case 5:
+		return 5
+	default:
+		return 3
+	}
+}
+
+// GetWriteQuorumSize returns the write quorum size.
+func (q *QuorumConfig) GetWriteQuorumSize() int {
+	return q.GetEnsembleSize()
+}
+
+// GetAckQuorumSize returns the ack quorum size.
+func (q *QuorumConfig) GetAckQuorumSize() int {
+	return (q.GetWriteQuorumSize() / 2) + 1
+}
+
+// SetBufferPoolSeeds replaces the seeds of the pool at idx in the static value.
+// NOTE: it writes the static value, so it has no effect once a dynamic
+// BufferPools source is bound (the source's value wins on the next Get()).
+func (q *QuorumConfig) SetBufferPoolSeeds(idx int, seeds []string) {
+	pools := q.BufferPools.Get()
+	pools[idx].Seeds = seeds
+	q.BufferPools.Set(pools)
+}
+
+// GRPCConfig stores the gRPC configuration for logstore.
+type GRPCConfig struct {
+	ServerMaxSendSize ByteSize `yaml:"serverMaxSendSize"` // Maximum size of each RPC request that the server can send
+	ServerMaxRecvSize ByteSize `yaml:"serverMaxRecvSize"` // Maximum size of each RPC request that the server can receive
+	ClientMaxSendSize ByteSize `yaml:"clientMaxSendSize"` // Maximum size of each RPC request that the client can send
+	ClientMaxRecvSize ByteSize `yaml:"clientMaxRecvSize"` // Maximum size of each RPC request that the client can receive
+}
+
+// GRPCClientConfig configures how a client dials logstores. DialTimeout has the
+// meaning of Milvus's grpc.client.dialTimeout, so an embedding Milvus can pass
+// its own value down.
+type GRPCClientConfig struct {
+	// DialTimeout bounds one attempt to establish a connection (gRPC's
+	// MinConnectTimeout, 20s when left unset). A call on a connection that is
+	// still connecting waits for the attempt, even a fail-fast one, so this is
+	// also how long a call to an address that never answers can wait before
+	// it fails: the reclaimed IP of a replaced pod, for one. Connecting to a
+	// live logstore in the same cluster takes milliseconds. Zero means the
+	// default, 1s. Milvus: grpc.client.dialTimeout.
+	DialTimeout DurationMilliseconds `yaml:"dialTimeout"`
+	// ConnectBackoff paces reconnection after a failed connection attempt. A
+	// zero BaseDelay means the default. It is not a call retry backoff, which
+	// is what Milvus's grpc.client.initialBackoff/maxBackoff configure.
+	ConnectBackoff GRPCBackoffConfig `yaml:"connectBackoff"`
+}
+
+// DefaultGRPCClientConfig returns the default client dial configuration.
+func DefaultGRPCClientConfig() GRPCClientConfig {
+	return GRPCClientConfig{
+		DialTimeout: NewDurationMillisecondsFromInt(1000),
+		// The values Milvus uses for its own internal clients.
+		ConnectBackoff: GRPCBackoffConfig{
+			BaseDelay:  NewDurationMillisecondsFromInt(100),
+			Multiplier: 1.6,
+			Jitter:     0.2,
+			MaxDelay:   NewDurationMillisecondsFromInt(3000),
+		},
+	}
+}
+
+// validate checks the dial configuration. A zero dial timeout, or a zero
+// backoff base delay, leaves that part at its default, so a configuration
+// built in code without this section stays valid.
+func (g *GRPCClientConfig) validate() error {
+	if g.DialTimeout.Duration.Duration() < 0 {
+		return fmt.Errorf("grpc client dial timeout cannot be negative, got %v", g.DialTimeout.Duration.Duration())
+	}
+	b := g.ConnectBackoff
+	if b.BaseDelay.Duration.Duration() < 0 {
+		return fmt.Errorf("grpc client connect backoff base delay cannot be negative, got %v", b.BaseDelay.Duration.Duration())
+	}
+	if b.BaseDelay.Duration.Duration() == 0 {
+		return nil
+	}
+	if b.MaxDelay.Duration.Duration() < b.BaseDelay.Duration.Duration() {
+		return fmt.Errorf("grpc client connect backoff max delay %v must not be below its base delay %v", b.MaxDelay.Duration.Duration(), b.BaseDelay.Duration.Duration())
+	}
+	if b.Multiplier < 1 {
+		return fmt.Errorf("grpc client connect backoff multiplier must be at least 1, got %v", b.Multiplier)
+	}
+	if b.Jitter < 0 || b.Jitter > 1 {
+		return fmt.Errorf("grpc client connect backoff jitter must be within [0, 1], got %v", b.Jitter)
+	}
+	return nil
+}
+
+// GRPCBackoffConfig is gRPC's connection backoff: the delay before the next
+// connection attempt starts at BaseDelay and grows by Multiplier, randomised
+// by Jitter, up to MaxDelay.
+type GRPCBackoffConfig struct {
+	BaseDelay  DurationMilliseconds `yaml:"baseDelay"`
+	Multiplier float64              `yaml:"multiplier"`
+	Jitter     float64              `yaml:"jitter"`
+	MaxDelay   DurationMilliseconds `yaml:"maxDelay"`
+}
+
+// GetServerMaxSendSize returns the server max send size in bytes as int.
+func (g *GRPCConfig) GetServerMaxSendSize() int {
+	return int(g.ServerMaxSendSize)
+}
+
+// GetServerMaxRecvSize returns the server max receive size in bytes as int.
+func (g *GRPCConfig) GetServerMaxRecvSize() int {
+	return int(g.ServerMaxRecvSize)
+}
+
+// GetClientMaxSendSize returns the client max send size in bytes as int.
+func (g *GRPCConfig) GetClientMaxSendSize() int {
+	return int(g.ClientMaxSendSize)
+}
+
+// GetClientMaxRecvSize returns the client max receive size in bytes as int.
+func (g *GRPCConfig) GetClientMaxRecvSize() int {
+	return int(g.ClientMaxRecvSize)
+}
+
+// SegmentReadPolicyConfig stores the segment read policy configuration.
+type SegmentReadPolicyConfig struct {
+	MaxBatchSize    ByteSize `yaml:"maxBatchSize"`
+	MaxFetchThreads int      `yaml:"maxFetchThreads"`
+}
+
+// SegmentSyncPolicyConfig stores the log file sync policy configuration.
+type SegmentSyncPolicyConfig struct {
+	MaxInterval                DurationMilliseconds `yaml:"maxInterval"`
+	MaxIntervalForLocalStorage DurationMilliseconds `yaml:"maxIntervalForLocalStorage"`
+	MaxIntervalForService      DurationMilliseconds `yaml:"maxIntervalForService"`
+	MaxEntries                 int                  `yaml:"maxEntries"`
+	MaxBytes                   ByteSize             `yaml:"maxBytes"`
+	MaxFlushRetries            int                  `yaml:"maxFlushRetries"`
+	RetryInterval              DurationMilliseconds `yaml:"retryInterval"`
+	MaxFlushSize               ByteSize             `yaml:"maxFlushSize"`
+	MaxFlushThreads            int                  `yaml:"maxFlushThreads"`
+}
+
+type SegmentCompactionPolicy struct {
+	MaxBytes           ByteSize        `yaml:"maxBytes"`
+	MaxParallelUploads int             `yaml:"maxParallelUploads"`
+	MaxParallelReads   int             `yaml:"maxParallelReads"`
+	Timeout            DurationSeconds `yaml:"timeout"`
+	// MaxInflightMemory caps the memory this node reserves for the compactions it is running,
+	// across every log it serves.
+	MaxInflightMemory ByteSize `yaml:"maxInflightMemory"`
+	// MemoryHighWatermark stops this node taking on new compactions once its memory usage passes
+	// this fraction of its limit. Applies only where a container limit can be read.
+	MemoryHighWatermark float64 `yaml:"memoryHighWatermark"`
+}
+
+// SyncSchedulerConfig stores the node-wide staged-storage sync scheduler configuration.
+type SyncSchedulerConfig struct {
+	// MaxWorkers is the number of workers in the node's shared flush pool, as a plain count.
+	//
+	// Each worker blocks in fdatasync while a flush is in flight, so this bounds how many
+	// concurrent syncs the node can have outstanding, not how much CPU it uses -- Go hands the
+	// P back for the duration of a blocking syscall, so a worker parked in fdatasync costs an
+	// OS thread rather than a core. Sizing it by CPU count therefore has no mechanical basis,
+	// and reading the host's core count (rather than the cgroup limit) made the effective value
+	// depend on which machine a pod happened to land on.
+	//
+	// Tune it from the volume's IOPS budget: workers ~= target IOPS x fsync latency. Past the
+	// point where the device saturates, more workers buy queueing rather than throughput, and
+	// shrink the per-block batching that absorbs load, so raise it toward the budget and not
+	// beyond.
+	MaxWorkers int `yaml:"maxWorkers"`
+}
+
+// RetentionPolicyConfig stores the data retention policy configuration.
+type RetentionPolicyConfig struct {
+	TTL int `yaml:"ttl"` // Time to live for truncated segments before eligible for GC
+}
+
+// FencePolicyConfig stores the fence policy configuration.
+type FencePolicyConfig struct {
+	ConditionWrite string `yaml:"conditionWrite"`
+}
+
+func (f *FencePolicyConfig) IsConditionWriteEnabled() bool {
+	return strings.EqualFold(f.ConditionWrite, "enable")
+}
+
+func (f *FencePolicyConfig) IsConditionWriteDisabled() bool {
+	return strings.EqualFold(f.ConditionWrite, "disable")
+}
+
+func (f *FencePolicyConfig) IsConditionWriteAuto() bool {
+	return strings.EqualFold(f.ConditionWrite, "auto")
+}
+
+func (f *FencePolicyConfig) SetConditionWriteEnableOrNot(enable bool) {
+	if enable {
+		f.ConditionWrite = "enable"
+	} else {
+		f.ConditionWrite = "disable"
+	}
+}
+
+// LogFileConfig stores the log file configuration.
+type LogFileConfig struct {
+	RootPath   string `yaml:"rootPath"`
+	MaxSize    int    `yaml:"maxSize"`
+	MaxAge     int    `yaml:"maxAge"`
+	MaxBackups int    `yaml:"maxBackups"`
+}
+
+// LogConfig stores the log configuration.
+type LogConfig struct {
+	Level  string        `yaml:"level"`
+	File   LogFileConfig `yaml:"file"`
+	Format string        `yaml:"format"`
+	Stdout bool          `yaml:"stdout"`
+}
+
+// JaegerConfig stores the Jaeger configuration.
+type JaegerConfig struct {
+	URL string `yaml:"url"`
+}
+
+// OtlpConfig stores the OTLP configuration.
+type OtlpConfig struct {
+	Endpoint string `yaml:"endpoint"`
+	Method   string `yaml:"method"`
+	Secure   bool   `yaml:"secure"`
+}
+
+// TraceConfig stores the trace configuration.
+type TraceConfig struct {
+	Exporter       string          `yaml:"exporter"`
+	SampleFraction float64         `yaml:"sampleFraction"`
+	Jaeger         JaegerConfig    `yaml:"jaeger"`
+	Otlp           OtlpConfig      `yaml:"otlp"`
+	InitTimeout    DurationSeconds `yaml:"initTimeoutSeconds"`
+}
+
+// EtcdSslConfig stores the ETCD SSL configuration.
+type EtcdSslConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	TlsCert       string `yaml:"tlsCert"`
+	TlsKey        string `yaml:"tlsKey"`
+	TlsCACert     string `yaml:"tlsCACert"`
+	TlsMinVersion string `yaml:"tlsMinVersion"`
+}
+
+// EtcdAuthConfig stores the ETCD authentication configuration.
+type EtcdAuthConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	UserName string `yaml:"userName"`
+	Password string `yaml:"password"`
+}
+
+// EtcdDataConfig stores the ETCD data configuration.
+type EtcdDataConfig struct {
+	Dir string `yaml:"dir"`
+}
+
+// EtcdUseConfig stores the ETCD usage configuration.
+type EtcdUseConfig struct {
+	Embed bool `yaml:"embed"`
+}
+
+// EtcdLogConfig stores the ETCD log configuration.
+type EtcdLogConfig struct {
+	Level string `yaml:"level"`
+	Path  string `yaml:"path"`
+}
+
+// EtcdConfig stores the ETCD configuration.
+type EtcdConfig struct {
+	Endpoints      []string             `yaml:"endpoints"`
+	RootPath       string               `yaml:"rootPath"`
+	MetaSubPath    string               `yaml:"metaSubPath"`
+	KvSubPath      string               `yaml:"kvSubPath"`
+	Log            EtcdLogConfig        `yaml:"log"`
+	Ssl            EtcdSslConfig        `yaml:"ssl"`
+	RequestTimeout DurationMilliseconds `yaml:"requestTimeout"`
+	Use            EtcdUseConfig        `yaml:"use"`
+	Data           EtcdDataConfig       `yaml:"data"`
+	Auth           EtcdAuthConfig       `yaml:"auth"`
+}
+
+func (etcdCfg *EtcdConfig) GetEndpoints() []string {
+	return etcdCfg.Endpoints
+}
+
+// MinioSslConfig stores the MinIO SSL configuration.
+type MinioSslConfig struct {
+	TlsCACert string `yaml:"tlsCACert"`
+}
+
+// MinioConfig stores the MinIO configuration.
+type MinioConfig struct {
+	Address            string               `yaml:"address"`
+	Port               int                  `yaml:"port"`
+	AccessKeyID        string               `yaml:"accessKeyID"`
+	SecretAccessKey    string               `yaml:"secretAccessKey"`
+	UseSSL             bool                 `yaml:"useSSL"`
+	Ssl                MinioSslConfig       `yaml:"ssl"`
+	BucketName         string               `yaml:"bucketName"`
+	CreateBucket       bool                 `yaml:"createBucket"`
+	RootPath           string               `yaml:"rootPath"`
+	UseIAM             bool                 `yaml:"useIAM"`
+	CloudProvider      string               `yaml:"cloudProvider"`
+	GcpCredentialJSON  string               `yaml:"gcpCredentialJSON"`
+	IamEndpoint        string               `yaml:"iamEndpoint"`
+	LogLevel           string               `yaml:"logLevel"`
+	Region             string               `yaml:"region"`
+	UseVirtualHost     bool                 `yaml:"useVirtualHost"`
+	RequestTimeoutMs   DurationMilliseconds `yaml:"requestTimeoutMs"`
+	ListObjectsMaxKeys int                  `yaml:"listObjectsMaxKeys"`
+}
+
+// LogstoreConfig stores the logstore configuration.
+type LogstoreConfig struct {
+	SegmentSyncPolicy       SegmentSyncPolicyConfig      `yaml:"segmentSyncPolicy"`
+	SegmentCompactionPolicy SegmentCompactionPolicy      `yaml:"segmentCompactionPolicy"`
+	SyncScheduler           SyncSchedulerConfig          `yaml:"syncScheduler"`
+	SegmentReadPolicy       SegmentReadPolicyConfig      `yaml:"segmentReadPolicy"`
+	RetentionPolicy         RetentionPolicyConfig        `yaml:"retentionPolicy"`
+	FencePolicy             FencePolicyConfig            `yaml:"fencePolicy"`
+	GRPCConfig              GRPCConfig                   `yaml:"grpc"`
+	ProcessorCleanupPolicy  ProcessorCleanupPolicyConfig `yaml:"processorCleanupPolicy"`
+	MaintenanceStrategy     MaintenanceStrategyConfig    `yaml:"maintenanceStrategy"`
+	NodeSelectionPolicy     NodeSelectionPolicyConfig    `yaml:"nodeSelectionPolicy"`
+	DiskWatermarkPolicy     DiskWatermarkPolicyConfig    `yaml:"diskWatermarkPolicy"`
+}
+
+// ProcessorCleanupPolicyConfig stores the background segment processor cleanup and shutdown configuration.
+type ProcessorCleanupPolicyConfig struct {
+	CleanupInterval DurationSeconds `yaml:"cleanupInterval"` // How often to scan for idle processors
+	MaxIdleTime     DurationSeconds `yaml:"maxIdleTime"`     // How long a processor can be idle before cleanup
+	ShutdownTimeout DurationSeconds `yaml:"shutdownTimeout"` // Timeout for closing all processors during LogStore shutdown
+}
+
+// MaintenanceStrategyConfig configures the node's autonomous self-maintenance tasks
+// (delete-marker reclaim, and future cleaner/gc tasks).
+type MaintenanceStrategyConfig struct {
+	// DeleteGracePeriod is how long after a log/instance is marked deleted before its
+	// LOCAL data is reclaimed (object storage is never auto-reclaimed). Default 5s:
+	// reclaim is near-real-time — calling the delete API means the caller has already
+	// confirmed the data is no longer needed. The short non-zero grace only preserves
+	// the marker's crash-safety (marker durably on disk before any data is removed).
+	DeleteGracePeriod DurationSeconds `yaml:"deleteGracePeriod"`
+	// DeleteReclaimInterval is how often the reclaim task scans delete markers.
+	// Default 2s, so deleted data disappears within ~grace+interval of the request.
+	DeleteReclaimInterval DurationSeconds `yaml:"deleteReclaimInterval"`
+	// CompactedFileCleanupInterval is how often the compacted-file-cleanup task scans
+	// staged segment directories for local data.log files that can be dropped now that
+	// their data is durably compacted in object storage. Default 5s. The task's pull-based
+	// reconcile pass (footer HEAD for segments not yet locally marked compacted) runs at a
+	// much lower cadence than this to bound object-storage request cost; see
+	// reconcileEveryNPasses in server/compacted_file_cleanup.go.
+	CompactedFileCleanupInterval DurationSeconds `yaml:"compactedFileCleanupInterval"`
+	// ReconcileMinDataLogAge gates the pull-based reconcile: the footer HEAD for an
+	// unmarked segment only runs once its local data.log has been idle (unmodified) for at
+	// least this long. Default 30m — comfortably past the client's segment roll interval
+	// plus compaction/upload time — so the reconcile only acts on data.log files old enough
+	// to be certainly compacted, avoiding wasted object-storage HEADs on segments still in
+	// the write->roll->compact pipeline. It does NOT gate the marked/push delete path (push
+	// is the intended fast reclaim). A value <= 0 disables the age gate.
+	ReconcileMinDataLogAge DurationSeconds `yaml:"reconcileMinDataLogAge"`
+}
+
+// NodeSelectionPolicyConfig controls load-aware quorum node selection (issue #114).
+type NodeSelectionPolicyConfig struct {
+	LoadAwareEnabled   bool            `yaml:"loadAwareEnabled"`   // master switch; default true
+	LoadReportInterval DurationSeconds `yaml:"loadReportInterval"` // how often a node publishes its load; default 10s
+	LoadTTL            DurationSeconds `yaml:"loadTTL"`            // load older than this is treated as unknown; default 30s
+	MemSoftThreshold   float64         `yaml:"memSoftThreshold"`   // memory ratio above which memory escalates load; default 0.85
+	EWMAAlpha          float64         `yaml:"ewmaAlpha"`          // EWMA weight on newest sample; default 0.5
+}
+
+// DiskWatermarkPolicyConfig controls local-WAL-disk watermark warning and write
+// backpressure (issue #215). Active only for service/local storage (nodes that keep
+// WAL data on a local disk). Ratio semantics are used/(used+free), matching df.
+type DiskWatermarkPolicyConfig struct {
+	Enabled            bool            `yaml:"enabled"`            // master switch; default true
+	SoftThresholdRatio float64         `yaml:"softThresholdRatio"` // warn watermark; default 0.80
+	HardThresholdRatio float64         `yaml:"hardThresholdRatio"` // block watermark; default 0.90; >=1.0 means warn-only
+	MinFreeBytes       ByteSize        `yaml:"minFreeBytes"`       // absolute free floor that also blocks; default 1Gi
+	SampleInterval     DurationSeconds `yaml:"sampleInterval"`     // default 10s
+	ThrottleEnabled    bool            `yaml:"throttleEnabled"`    // probabilistic rejection between soft and hard; default true
+}
+
+type StorageConfig struct {
+	Type     string `yaml:"type"`
+	RootPath string `yaml:"rootPath"`
+}
+
+func (s *StorageConfig) IsStorageLocal() bool {
+	return s.Type == "local"
+}
+
+func (s *StorageConfig) IsStorageMinio() bool {
+	return s.Type == "minio" || s.Type == "default" || len(s.Type) == 0
+}
+
+func (s *StorageConfig) IsStorageService() bool {
+	return s.Type == "service"
+}
+
+// OpRegistryConfig controls the in-flight operation registry.
+type OpRegistryConfig struct {
+	Capacity int             `yaml:"capacity"` // Pool size; default 1024
+	WarnAge  DurationSeconds `yaml:"warnAge"`  // Young/old eviction boundary; default 30s
+}
+
+// RuntimeConfig holds runtime subsystem configuration.
+type RuntimeConfig struct {
+	OpRegistry OpRegistryConfig `yaml:"opRegistry"`
+}
+
+// WoodpeckerConfig stores the complete Woodpecker configuration.
+type WoodpeckerConfig struct {
+	Meta     MetaConfig     `yaml:"meta"`
+	Client   ClientConfig   `yaml:"client"`
+	Logstore LogstoreConfig `yaml:"logstore"`
+	Storage  StorageConfig  `yaml:"storage"`
+	Runtime  RuntimeConfig  `yaml:"runtime"`
+}
+
+type Configuration struct {
+	Woodpecker WoodpeckerConfig `yaml:"woodpecker"`
+	Log        LogConfig        `yaml:"log"`
+	Trace      TraceConfig      `yaml:"trace"`
+	Etcd       EtcdConfig       `yaml:"etcd"`
+	Minio      MinioConfig      `yaml:"minio"`
+}
+
+// NewConfiguration reads the WoodpeckerConfig from a YAML file.
+func NewConfiguration(files ...string) (*Configuration, error) {
+	wpConfig := getDefaultWoodpeckerConfig()
+	logConfig := getDefaultLoggerConfig()
+	traceConfig := getDefaultTraceConfig()
+	etcdConfig := getDefaultEtcdConfig()
+	minioConfig := getDefaultMinioConfig()
+	config := &Configuration{
+		Woodpecker: wpConfig,
+		Log:        logConfig,
+		Trace:      traceConfig,
+		Etcd:       etcdConfig,
+		Minio:      minioConfig,
+	}
+	if len(files) == 0 {
+		// The all-defaults / programmatic path is validated too: for embedding callers this
+		// is the only validation gate before the config is consumed.
+		if err := config.Validate(); err != nil {
+			return nil, err
+		}
+		return config, nil
+	}
+
+	// read all files
+	for _, filePath := range files {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		err = yaml.Unmarshal(data, config)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err := config.Validate()
+	if err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+func (c *Configuration) Validate() error {
+	// Validate Woodpecker configuration
+	if err := c.validateWoodpeckerConfig(); err != nil {
+		return fmt.Errorf("woodpecker config validation failed: %w", err)
+	}
+
+	// Validate Minio configuration
+	if err := c.ValidateMinioConfig(); err != nil {
+		return fmt.Errorf("minio config validation failed: %w", err)
+	}
+
+	// Validate other configurations if needed
+	// TODO: Add validation for dependent configurations, such as trace config, etcd config, etc.
+
+	return nil
+}
+
+// ValidateRootPathValue checks that a rootPath value is in the canonical form woodpecker
+// consumes VERBATIM — for object keys (<rootPath>/<logId>/<segId>/...), local staged
+// directories, and metric labels there is deliberately no normalization anywhere on the
+// chain. Shared by the local-config validation below and by RPC boundaries that receive a
+// caller-managed rootPath (service mode's NotifySegmentCompacted).
+func ValidateRootPathValue(rp string) error {
+	if rp == "" {
+		return nil // empty = bucket root
+	}
+	if rp == "." || rp == ".." || strings.HasPrefix(rp, "/") || strings.HasSuffix(rp, "/") ||
+		strings.HasPrefix(rp, "../") || rp != path.Clean(rp) {
+		return fmt.Errorf("invalid minio rootPath %q: must be a clean relative path such as "+
+			"\"woodpecker\" or \"wp/data\" (no leading/trailing/doubled slashes, no \".\" or \"..\" "+
+			"segments), or empty for the bucket root", rp)
+	}
+	return nil
+}
+
+// ValidateMinioConfig checks the object-storage configuration. Enforcement is scoped by
+// storage mode:
+//
+//   - service (staged) mode HARD-FAILS on a non-canonical rootPath: the pull-reconcile path
+//     re-derives rootPath from the on-disk layout (path.Join-canonicalized), so push and pull
+//     only agree when the configured value is already canonical.
+//   - minio/local modes only WARN: every key/dir/label-building site uses the raw value
+//     verbatim, so even a non-canonical value is self-consistent end-to-end — exactly as it
+//     was before validation existed. Hard-failing here would break existing deployments on
+//     upgrade for no correctness gain (and normalizing instead would silently re-key their
+//     object space, orphaning previously written objects — strictly worse).
+//
+// It is exported separately so consumption points (the server and client constructors) can
+// re-check the object-storage section of a possibly hand-rolled or post-load-mutated config
+// without imposing the full Validate() on partial configurations.
+func (c *Configuration) ValidateMinioConfig() error {
+	err := ValidateRootPathValue(c.Minio.RootPath)
+	if err == nil {
+		return nil
+	}
+	if c.Woodpecker.Storage.IsStorageService() {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[WARN] woodpecker: %v — tolerated in %q storage mode (keys are built "+
+		"verbatim and stay self-consistent), but service mode rejects this value\n",
+		err, c.Woodpecker.Storage.Type)
+	return nil
+}
+
+func (c *Configuration) validateWoodpeckerConfig() error {
+	// Validate Meta configuration
+	if err := c.validateMetaConfig(); err != nil {
+		return fmt.Errorf("meta config validation failed: %w", err)
+	}
+
+	// Validate Client configuration
+	if err := c.validateClientConfig(); err != nil {
+		return fmt.Errorf("client config validation failed: %w", err)
+	}
+
+	// Validate Logstore configuration
+	if err := c.validateLogstoreConfig(); err != nil {
+		return fmt.Errorf("logstore config validation failed: %w", err)
+	}
+
+	// Validate Storage configuration
+	if err := c.validateStorageConfig(); err != nil {
+		return fmt.Errorf("storage config validation failed: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Configuration) validateMetaConfig() error {
+	meta := &c.Woodpecker.Meta
+
+	// Validate meta type
+	validMetaTypes := map[string]bool{"etcd": true}
+	if !validMetaTypes[meta.Type] {
+		return fmt.Errorf("invalid meta type '%s', must be 'etcd'", meta.Type)
+	}
+
+	// Validate prefix
+	if len(meta.Prefix) == 0 {
+		return fmt.Errorf("meta prefix cannot be empty")
+	}
+
+	return nil
+}
+
+func (c *Configuration) validateClientConfig() error {
+	client := &c.Woodpecker.Client
+
+	// Validate SegmentAppend configuration
+	if client.SegmentAppend.QueueSize <= 0 {
+		return fmt.Errorf("segment append queue size must be positive, got %d", client.SegmentAppend.QueueSize)
+	}
+	if client.SegmentAppend.MaxRetries < 0 {
+		return fmt.Errorf("segment append max retries cannot be negative, got %d", client.SegmentAppend.MaxRetries)
+	}
+	if err := client.GRPC.validate(); err != nil {
+		return err
+	}
+
+	// Zero leaves these bounds at their defaults, so a configuration built in code
+	// without them stays valid; only a negative bound is a mistake.
+	if client.SegmentAppend.SendTimeout.Duration.Duration() < 0 {
+		return fmt.Errorf("segment append send timeout cannot be negative, got %v", client.SegmentAppend.SendTimeout.Duration.Duration())
+	}
+	if client.Quorum.SelectNodesTimeout.Duration.Duration() < 0 {
+		return fmt.Errorf("quorum select nodes timeout cannot be negative, got %v", client.Quorum.SelectNodesTimeout.Duration.Duration())
+	}
+
+	if client.SkipRangeRefreshInterval.Duration.Duration() < 0 {
+		return fmt.Errorf("skip range refresh interval cannot be negative, got %v", client.SkipRangeRefreshInterval.Duration.Duration())
+	}
+
+	// Zero leaves a read bound at its default, so a configuration built in code
+	// without them stays valid.
+	active, settled := client.SegmentRead.ActiveTimeout.Duration.Duration(), client.SegmentRead.SettledTimeout.Duration.Duration()
+	if active < 0 || settled < 0 {
+		return fmt.Errorf("segment read timeouts cannot be negative, got active %v, settled %v", active, settled)
+	}
+	if active > 0 && settled > 0 && active > settled {
+		return fmt.Errorf("segment read active timeout %v must not exceed the settled timeout %v", active, settled)
+	}
+
+	// Validate SegmentRollingPolicy configuration
+	if client.SegmentRollingPolicy.MaxSize <= 0 {
+		return fmt.Errorf("segment rolling policy max size must be positive, got %d", client.SegmentRollingPolicy.MaxSize.Int64())
+	}
+	if client.SegmentRollingPolicy.MaxInterval.Seconds() <= 0 {
+		return fmt.Errorf("segment rolling policy max interval must be positive, got %d", client.SegmentRollingPolicy.MaxInterval.Seconds())
+	}
+	if client.SegmentRollingPolicy.MaxBlocks <= 0 {
+		return fmt.Errorf("segment rolling policy max blocks must be positive, got %d", client.SegmentRollingPolicy.MaxBlocks)
+	}
+
+	// Validate Auditor configuration
+	if client.Auditor.MaxInterval.Seconds() <= 0 {
+		return fmt.Errorf("auditor max interval must be positive, got %d", client.Auditor.MaxInterval.Seconds())
+	}
+	if client.Auditor.CompactionAttemptTimeout.Seconds() <= 0 {
+		return fmt.Errorf("auditor compaction attempt timeout must be positive, got %ds", client.Auditor.CompactionAttemptTimeout.Seconds())
+	}
+	if client.Auditor.CompactionPassBudget.Seconds() <= 0 {
+		return fmt.Errorf("auditor compaction pass budget must be positive, got %ds", client.Auditor.CompactionPassBudget.Seconds())
+	}
+
+	// Validate DirectRead configuration
+	if client.DirectRead.Enabled {
+		if client.DirectRead.MaxBatchSize <= 0 {
+			return fmt.Errorf("direct read max batch size must be positive, got %d", client.DirectRead.MaxBatchSize.Int64())
+		}
+		if client.DirectRead.MaxFetchThreads <= 0 {
+			return fmt.Errorf("direct read max fetch threads must be positive, got %d", client.DirectRead.MaxFetchThreads)
+		}
+	}
+
+	// Validate Quorum configuration only when storage type is "service"
+	if c.Woodpecker.Storage.IsStorageService() {
+		if err := c.validateQuorumConfig(); err != nil {
+			return fmt.Errorf("quorum config validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Configuration) validateQuorumConfig() error {
+	q := &c.Woodpecker.Client.Quorum
+	bufferPools := q.BufferPools.Get()
+	customPlacement := q.SelectStrategy.CustomPlacement.Get()
+
+	// Basic quorum size validation
+	ensembleSize := q.GetEnsembleSize()
+	writeQuorumSize := q.GetWriteQuorumSize()
+	ackQuorumSize := q.GetAckQuorumSize()
+
+	if ensembleSize <= 0 {
+		return fmt.Errorf("ensemble size must be positive, got %d", ensembleSize)
+	}
+	if writeQuorumSize <= 0 {
+		return fmt.Errorf("write quorum size must be positive, got %d", writeQuorumSize)
+	}
+	if ackQuorumSize <= 0 {
+		return fmt.Errorf("ack quorum size must be positive, got %d", ackQuorumSize)
+	}
+	if writeQuorumSize > ensembleSize {
+		return fmt.Errorf("write quorum size (%d) cannot be larger than ensemble size (%d)", writeQuorumSize, ensembleSize)
+	}
+	if ackQuorumSize > writeQuorumSize {
+		return fmt.Errorf("ack quorum size (%d) cannot be larger than write quorum size (%d)", ackQuorumSize, writeQuorumSize)
+	}
+
+	// Validate affinity mode (allow empty for backward compatibility)
+	validAffinityModes := map[string]bool{"soft": true, "hard": true, "": true}
+	if !validAffinityModes[q.SelectStrategy.AffinityMode.Get()] {
+		return fmt.Errorf("invalid affinity mode '%s', must be 'soft' or 'hard'", q.SelectStrategy.AffinityMode.Get())
+	}
+
+	// Validate strategy (allow unknown strategies for backward compatibility - they'll default to random)
+	validStrategies := map[string]bool{
+		"single-az-single-rg": true,
+		"single-az-multi-rg":  true,
+		"multi-az-single-rg":  true,
+		"multi-az-multi-rg":   true,
+		"cross-region":        true,
+		"custom":              true,
+		"random-group":        true,
+		"random":              true,
+		"":                    true, // Allow empty for backward compatibility
+	}
+	if !validStrategies[q.SelectStrategy.Strategy.Get()] {
+		// Log warning but don't fail for unknown strategies (backward compatibility)
+		fmt.Printf("Warning: unknown strategy '%s', will default to 'random'\n", q.SelectStrategy.Strategy.Get())
+	}
+
+	// Validate BufferPools
+	if len(bufferPools) == 0 {
+		return fmt.Errorf("at least one buffer pool must be configured")
+	}
+
+	for i, pool := range bufferPools {
+		if len(pool.Name) == 0 {
+			return fmt.Errorf("buffer pool %d name cannot be empty", i)
+		}
+		if len(pool.Seeds) == 0 {
+			return fmt.Errorf("buffer pool '%s' must have at least one seed", pool.Name)
+		}
+		for j, seed := range pool.Seeds {
+			if len(seed) == 0 {
+				return fmt.Errorf("buffer pool '%s' seed %d cannot be empty", pool.Name, j)
+			}
+		}
+	}
+
+	// Validate custom placement if strategy is custom
+	if q.SelectStrategy.Strategy.Get() == "custom" {
+		if len(customPlacement) == 0 {
+			return fmt.Errorf("custom strategy requires at least one custom placement rule")
+		}
+		if len(customPlacement) != ensembleSize {
+			return fmt.Errorf("custom placement rules count (%d) must equal ensemble size (%d)",
+				len(customPlacement), ensembleSize)
+		}
+
+		// Validate each custom placement
+		for i, placement := range customPlacement {
+			if len(placement.Region) == 0 {
+				return fmt.Errorf("custom placement rule %d region cannot be empty", i)
+			}
+			if len(placement.Az) == 0 {
+				return fmt.Errorf("custom placement rule %d az cannot be empty", i)
+			}
+			if len(placement.ResourceGroup) == 0 {
+				return fmt.Errorf("custom placement rule %d resource group cannot be empty", i)
+			}
+
+			// Verify that the region exists in buffer pools
+			found := false
+			for _, pool := range bufferPools {
+				if pool.Name == placement.Region {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("custom placement rule %d references unknown region '%s'", i, placement.Region)
+			}
+		}
+	}
+
+	// Validate cross-region strategy requirements
+	if q.SelectStrategy.Strategy.Get() == "cross-region" {
+		if len(bufferPools) < 2 {
+			return fmt.Errorf("cross-region strategy requires at least 2 buffer pools, got %d", len(bufferPools))
+		}
+	}
+
+	return nil
+}
+
+func (c *Configuration) validateLogstoreConfig() error {
+	logstore := &c.Woodpecker.Logstore
+
+	// Validate SegmentSyncPolicy
+	if logstore.SegmentSyncPolicy.MaxInterval.Milliseconds() <= 0 {
+		return fmt.Errorf("segment sync policy max interval must be positive, got %d", logstore.SegmentSyncPolicy.MaxInterval.Milliseconds())
+	}
+	if logstore.SegmentSyncPolicy.MaxIntervalForLocalStorage.Milliseconds() <= 0 {
+		return fmt.Errorf("segment sync policy max interval for local storage must be positive, got %d", logstore.SegmentSyncPolicy.MaxIntervalForLocalStorage.Milliseconds())
+	}
+	if logstore.SegmentSyncPolicy.MaxIntervalForService.Milliseconds() <= 0 {
+		return fmt.Errorf("segment sync policy max interval for service must be positive, got %d", logstore.SegmentSyncPolicy.MaxIntervalForService.Milliseconds())
+	}
+	if logstore.SegmentSyncPolicy.MaxEntries <= 0 {
+		return fmt.Errorf("segment sync policy max entries must be positive, got %d", logstore.SegmentSyncPolicy.MaxEntries)
+	}
+	if logstore.SegmentSyncPolicy.MaxBytes <= 0 {
+		return fmt.Errorf("segment sync policy max bytes must be positive, got %d", logstore.SegmentSyncPolicy.MaxBytes.Int64())
+	}
+	if logstore.SegmentSyncPolicy.MaxFlushRetries < 0 {
+		return fmt.Errorf("segment sync policy max flush retries cannot be negative, got %d", logstore.SegmentSyncPolicy.MaxFlushRetries)
+	}
+	if logstore.SegmentSyncPolicy.RetryInterval.Milliseconds() <= 0 {
+		return fmt.Errorf("segment sync policy retry interval must be positive, got %d", logstore.SegmentSyncPolicy.RetryInterval.Milliseconds())
+	}
+	if logstore.SegmentSyncPolicy.MaxFlushSize <= 0 {
+		return fmt.Errorf("segment sync policy max flush size must be positive, got %d", logstore.SegmentSyncPolicy.MaxFlushSize.Int64())
+	}
+	if logstore.SegmentSyncPolicy.MaxFlushThreads <= 0 {
+		return fmt.Errorf("segment sync policy max flush threads must be positive, got %d", logstore.SegmentSyncPolicy.MaxFlushThreads)
+	}
+
+	// Validate SegmentCompactionPolicy
+	if logstore.SyncScheduler.MaxWorkers <= 0 {
+		return fmt.Errorf("sync scheduler max workers must be positive, got %d", logstore.SyncScheduler.MaxWorkers)
+	}
+	if logstore.SegmentCompactionPolicy.MaxBytes <= 0 {
+		return fmt.Errorf("segment compaction policy max bytes must be positive, got %d", logstore.SegmentCompactionPolicy.MaxBytes.Int64())
+	}
+	if logstore.SegmentCompactionPolicy.MaxInflightMemory <= 0 {
+		return fmt.Errorf("segment compaction policy max inflight memory must be positive, got %d", logstore.SegmentCompactionPolicy.MaxInflightMemory.Int64())
+	}
+	if w := logstore.SegmentCompactionPolicy.MemoryHighWatermark; w <= 0 || w > 1 {
+		return fmt.Errorf("segment compaction policy memory high watermark must be in (0,1], got %v", w)
+	}
+	if logstore.SegmentCompactionPolicy.MaxParallelUploads <= 0 {
+		return fmt.Errorf("segment compaction policy max parallel uploads must be positive, got %d", logstore.SegmentCompactionPolicy.MaxParallelUploads)
+	}
+	if logstore.SegmentCompactionPolicy.MaxParallelReads <= 0 {
+		return fmt.Errorf("segment compaction policy max parallel reads must be positive, got %d", logstore.SegmentCompactionPolicy.MaxParallelReads)
+	}
+	if logstore.SegmentCompactionPolicy.Timeout.Seconds() <= 0 {
+		return fmt.Errorf("segment compaction policy timeout must be positive, got %ds", logstore.SegmentCompactionPolicy.Timeout.Seconds())
+	}
+
+	// Validate SegmentReadPolicy
+	if logstore.SegmentReadPolicy.MaxBatchSize <= 0 {
+		return fmt.Errorf("segment read policy max batch size must be positive, got %d", logstore.SegmentReadPolicy.MaxBatchSize.Int64())
+	}
+	if logstore.SegmentReadPolicy.MaxFetchThreads <= 0 {
+		return fmt.Errorf("segment read policy max fetch threads must be positive, got %d", logstore.SegmentReadPolicy.MaxFetchThreads)
+	}
+
+	if logstore.MaintenanceStrategy.DeleteGracePeriod.Milliseconds() <= 0 {
+		return fmt.Errorf("maintenance strategy delete grace period must be positive, got %d", logstore.MaintenanceStrategy.DeleteGracePeriod.Milliseconds())
+	}
+	if logstore.MaintenanceStrategy.DeleteReclaimInterval.Milliseconds() <= 0 {
+		return fmt.Errorf("maintenance strategy delete reclaim interval must be positive, got %d", logstore.MaintenanceStrategy.DeleteReclaimInterval.Milliseconds())
+	}
+	if logstore.MaintenanceStrategy.CompactedFileCleanupInterval.Milliseconds() <= 0 {
+		return fmt.Errorf("maintenance strategy compacted file cleanup interval must be positive, got %d", logstore.MaintenanceStrategy.CompactedFileCleanupInterval.Milliseconds())
+	}
+
+	p := logstore.NodeSelectionPolicy
+	if p.LoadAwareEnabled {
+		if p.MemSoftThreshold < 0 || p.MemSoftThreshold > 1 {
+			return fmt.Errorf("nodeSelectionPolicy.memSoftThreshold must be in [0,1], got %v", p.MemSoftThreshold)
+		}
+		if p.EWMAAlpha <= 0 || p.EWMAAlpha > 1 {
+			return fmt.Errorf("nodeSelectionPolicy.ewmaAlpha must be in (0,1], got %v", p.EWMAAlpha)
+		}
+	}
+
+	dw := logstore.DiskWatermarkPolicy
+	if dw.Enabled {
+		if dw.SoftThresholdRatio <= 0 || dw.SoftThresholdRatio > dw.HardThresholdRatio {
+			return fmt.Errorf("diskWatermarkPolicy: require 0 < softThresholdRatio <= hardThresholdRatio, got soft=%v hard=%v",
+				dw.SoftThresholdRatio, dw.HardThresholdRatio)
+		}
+		if dw.MinFreeBytes < 0 {
+			return fmt.Errorf("diskWatermarkPolicy.minFreeBytes must be >= 0, got %d", dw.MinFreeBytes.Int64())
+		}
+	}
+
+	return nil
+}
+
+func (c *Configuration) validateStorageConfig() error {
+	storage := &c.Woodpecker.Storage
+
+	// Validate storage type
+	validStorageTypes := map[string]bool{"local": true, "minio": true, "default": true, "service": true, "": true}
+	if !validStorageTypes[storage.Type] {
+		return fmt.Errorf("invalid storage type '%s', must be one of: local, minio, default, service", storage.Type)
+	}
+
+	// Validate root path
+	if len(storage.RootPath) == 0 {
+		return fmt.Errorf("storage root path cannot be empty")
+	}
+
+	return nil
+}
+
+func getDefaultWoodpeckerConfig() WoodpeckerConfig {
+	return WoodpeckerConfig{
+		Meta: MetaConfig{
+			Type:   "etcd",
+			Prefix: "woodpecker",
+		},
+		Client: ClientConfig{
+			SegmentAppend: SegmentAppendConfig{
+				QueueSize:  100,
+				MaxRetries: 2,
+				// Client-side group commit is ON by default: consecutive appends
+				// already queued are coalesced into one AddEntries request, bounded
+				// by MaxBatchEntries entries or MaxBatchBytes bytes (whichever first).
+				// Batching is opportunistic (drains only what is already queued), so
+				// it adds no latency at low load. Set MaxBatchEntries to 1 to disable.
+				MaxBatchEntries: 1000,
+				MaxBatchBytes:   ByteSize(2000000), // 2MB
+				SendTimeout:     NewDurationMillisecondsFromInt(2000),
+			},
+			SegmentRollingPolicy: SegmentRollingPolicyConfig{
+				MaxSize:     ByteSize(100000000),
+				MaxInterval: DurationSeconds{Duration: Duration{duration: 800 * 1000000000}}, // 800s
+				MaxBlocks:   1000,
+			},
+			Auditor: AuditorConfig{
+				MaxInterval:              DurationSeconds{Duration: Duration{duration: 5 * 1000000000}}, // 5s
+				CompactionAttemptTimeout: NewDurationSecondsFromInt(330),
+				CompactionPassBudget:     NewDurationSecondsFromInt(60),
+			},
+			Quorum: QuorumConfig{
+				BufferPools: NewDynamic([]QuorumBufferPool{
+					{
+						Name:  "default-pool",
+						Seeds: []string{},
+					},
+				}),
+				SelectStrategy: QuorumSelectStrategy{
+					AffinityMode:    NewDynamic("soft"),
+					Replicas:        NewDynamic(3),
+					Strategy:        NewDynamic("random"),
+					CustomPlacement: NewDynamic([]CustomPlacement{}),
+				},
+				SelectNodesTimeout: NewDurationMillisecondsFromInt(2000),
+			},
+			SessionMonitor: SessionMonitorConfig{
+				CheckInterval: DurationSeconds{Duration: Duration{duration: 3 * time.Second}},
+				MaxFailures:   5,
+			},
+			DirectRead: DirectReadConfig{
+				Enabled:         true,
+				MaxBatchSize:    ByteSize(16 * 1024 * 1024), // 16MB
+				MaxFetchThreads: 4,
+			},
+			GRPC: DefaultGRPCClientConfig(),
+			SegmentRead: SegmentReadConfig{
+				ActiveTimeout:  NewDurationMillisecondsFromInt(3000),
+				SettledTimeout: NewDurationMillisecondsFromInt(20000),
+			},
+		},
+		Logstore: LogstoreConfig{
+			SegmentSyncPolicy: SegmentSyncPolicyConfig{
+				MaxInterval:                DurationMilliseconds{Duration: Duration{duration: 1000 * 1000000}}, // 1000ms
+				MaxIntervalForLocalStorage: DurationMilliseconds{Duration: Duration{duration: 5 * 1000000}},    // 5ms
+				MaxIntervalForService:      DurationMilliseconds{Duration: Duration{duration: 1 * 1000000}},    // 1ms
+				MaxEntries:                 2000,
+				MaxBytes:                   ByteSize(100000000),
+				MaxFlushRetries:            3,
+				RetryInterval:              DurationMilliseconds{Duration: Duration{duration: 2000 * 1000000}}, // 2000ms
+				MaxFlushSize:               ByteSize(16000000),
+				MaxFlushThreads:            8,
+			},
+			SyncScheduler: SyncSchedulerConfig{
+				MaxWorkers: 32,
+			},
+			SegmentCompactionPolicy: SegmentCompactionPolicy{
+				MaxBytes:            ByteSize(32000000),
+				MaxParallelUploads:  4,
+				MaxParallelReads:    8,
+				Timeout:             NewDurationSecondsFromInt(300),
+				MaxInflightMemory:   ByteSize(1000000000),
+				MemoryHighWatermark: 0.7,
+			},
+			SegmentReadPolicy: SegmentReadPolicyConfig{
+				MaxBatchSize:    ByteSize(16000000),
+				MaxFetchThreads: 32,
+			},
+			RetentionPolicy: RetentionPolicyConfig{
+				TTL: 259200, // 72 hours
+			},
+			FencePolicy: FencePolicyConfig{
+				ConditionWrite: "auto",
+			},
+			GRPCConfig: GRPCConfig{
+				ServerMaxSendSize: ByteSize(512 * 1024 * 1024), // 512 MB
+				ServerMaxRecvSize: ByteSize(256 * 1024 * 1024), // 256 MB
+				ClientMaxSendSize: ByteSize(256 * 1024 * 1024), // 256 MB
+				ClientMaxRecvSize: ByteSize(512 * 1024 * 1024), // 512 MB
+			},
+			ProcessorCleanupPolicy: ProcessorCleanupPolicyConfig{
+				CleanupInterval: DurationSeconds{Duration: Duration{duration: 60 * time.Second}},  // 1 min
+				MaxIdleTime:     DurationSeconds{Duration: Duration{duration: 300 * time.Second}}, // 5 min
+				ShutdownTimeout: DurationSeconds{Duration: Duration{duration: 15 * time.Second}},  // 15s
+			},
+			MaintenanceStrategy: MaintenanceStrategyConfig{
+				DeleteGracePeriod:            DurationSeconds{Duration: Duration{duration: 5 * time.Second}},
+				DeleteReclaimInterval:        DurationSeconds{Duration: Duration{duration: 2 * time.Second}},
+				CompactedFileCleanupInterval: DurationSeconds{Duration: Duration{duration: 5 * time.Second}},
+				ReconcileMinDataLogAge:       DurationSeconds{Duration: Duration{duration: 30 * time.Minute}},
+			},
+			NodeSelectionPolicy: NodeSelectionPolicyConfig{
+				LoadAwareEnabled:   true,
+				LoadReportInterval: DurationSeconds{Duration: Duration{duration: 10 * time.Second}},
+				LoadTTL:            DurationSeconds{Duration: Duration{duration: 30 * time.Second}},
+				MemSoftThreshold:   0.85,
+				EWMAAlpha:          0.5,
+			},
+			DiskWatermarkPolicy: DiskWatermarkPolicyConfig{
+				Enabled:            true,
+				SoftThresholdRatio: 0.80,
+				HardThresholdRatio: 0.90,
+				MinFreeBytes:       ByteSize(1 * 1024 * 1024 * 1024), // 1Gi
+				SampleInterval:     DurationSeconds{Duration: Duration{duration: 10 * time.Second}},
+				ThrottleEnabled:    true,
+			},
+		},
+		Storage: StorageConfig{
+			Type:     "default",
+			RootPath: "/tmp/woodpecker",
+		},
+		Runtime: RuntimeConfig{
+			OpRegistry: OpRegistryConfig{
+				Capacity: 1024,
+				WarnAge:  DurationSeconds{Duration: Duration{duration: 30 * time.Second}},
+			},
+		},
+	}
+}
+
+func getDefaultLoggerConfig() LogConfig {
+	return LogConfig{
+		Level:  "info",
+		Format: "text",
+		Stdout: true,
+		File: LogFileConfig{
+			RootPath:   "./logs",
+			MaxSize:    100,
+			MaxBackups: 10,
+			MaxAge:     30,
+		},
+	}
+}
+
+func getDefaultTraceConfig() TraceConfig {
+	return TraceConfig{
+		Exporter: "noop",
+		Jaeger: JaegerConfig{
+			URL: "http://localhost:14268/api/traces",
+		},
+		Otlp: OtlpConfig{
+			Endpoint: "localhost:4317",
+			Method:   "grpc",
+			Secure:   false,
+		},
+		SampleFraction: 1.0,
+		InitTimeout:    DurationSeconds{Duration: Duration{duration: 10 * 1000000000}}, // 10s
+	}
+}
+
+func getDefaultEtcdConfig() EtcdConfig {
+	return EtcdConfig{
+		Endpoints:      []string{"localhost:2379"},
+		RootPath:       "woodpecker",
+		MetaSubPath:    "meta",
+		KvSubPath:      "kv",
+		Log:            EtcdLogConfig{Level: "info", Path: "./logs"},
+		Ssl:            EtcdSslConfig{Enabled: false},
+		RequestTimeout: DurationMilliseconds{Duration: Duration{duration: 10000 * time.Millisecond}}, // 10000ms
+		Use:            EtcdUseConfig{Embed: false},
+	}
+}
+
+func getDefaultMinioConfig() MinioConfig {
+	return MinioConfig{
+		Address:         "localhost",
+		Port:            9000,
+		AccessKeyID:     "minioadmin",
+		SecretAccessKey: "minioadmin",
+		UseSSL:          false,
+		BucketName:      "a-bucket",
+		CreateBucket:    true,
+		Ssl: MinioSslConfig{
+			TlsCACert: "/path/to/public.crt",
+		},
+		RootPath:           "files",
+		UseIAM:             false,
+		CloudProvider:      "aws",
+		GcpCredentialJSON:  "",
+		IamEndpoint:        "",
+		LogLevel:           "fatal",
+		Region:             "",
+		UseVirtualHost:     false,
+		RequestTimeoutMs:   DurationMilliseconds{Duration: Duration{duration: 1000 * 1000000}}, // 1000ms
+		ListObjectsMaxKeys: 0,
+	}
+}
