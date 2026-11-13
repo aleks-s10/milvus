@@ -86,4 +86,7 @@ done
 mkdir -p "${MODULE_DST_DIR}"
 cp -f providers/fips.so "${MODULE_DST_DIR}/fips.so"
 cp -f fipsmodule.cnf "${CONFIG_DST}"
+# Strict builds load only this provider (see openssl-fips-strict.cnf), so leave
+# out Conan's legacy provider, including a copy left in lib/ by an earlier install.
+rm -f "${MODULE_DST_DIR}/legacy.so" "${REPO_ROOT}/lib/ossl-modules/legacy.so"
 echo "Installed OpenSSL ${OPENSSL_VERSION} FIPS provider to ${MODULE_DST_DIR}/fips.so"
