@@ -1,13 +1,13 @@
 # Fork test branch only, never proposed upstream: builds the integrated FIPS 3.0 image
 # (strict + OpenSSL tokenizer TLS + noembedetcd + PBKDF2 + milvus-storage without
-# external table formats) on x86-64, then scans and smoke-tests it.
+# external table formats + nobcrypt) on x86-64, then scans and smoke-tests it.
 name: FIPS x86-64 3.0 integrated
 on:
   push:
     branches: [ci/fips-x86-3.0-integrated]
 env:
   MS_PIN: e5321520
-  FLAGS: MILVUS_FIPS_ENABLED=ON MILVUS_FIPS_STRICT=ON TANTIVY_ANALYZER_REMOTE_TLS=OFF TANTIVY_ANALYZER_REMOTE_TLS_OPENSSL=ON MILVUS_NO_EMBED_ETCD=ON
+  FLAGS: MILVUS_FIPS_ENABLED=ON MILVUS_FIPS_STRICT=ON TANTIVY_ANALYZER_REMOTE_TLS=OFF TANTIVY_ANALYZER_REMOTE_TLS_OPENSSL=ON MILVUS_NO_EMBED_ETCD=ON MILVUS_NO_BCRYPT=ON
 jobs:
   build:
     runs-on: ubuntu-22.04
