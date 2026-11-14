@@ -7,9 +7,45 @@ on:
     branches: [ci/fips-x86-3.0-integrated]
 env:
   MS_PIN: e5321520
+  # 3 of the runner's 4 cores, so the runner agent isn't starved (an earlier run lost contact at -j4).
+  JOBS: 3
   FLAGS: MILVUS_FIPS_ENABLED=ON MILVUS_FIPS_STRICT=ON TANTIVY_ANALYZER_REMOTE_TLS=OFF TANTIVY_ANALYZER_REMOTE_TLS_OPENSSL=ON MILVUS_NO_EMBED_ETCD=ON MILVUS_NO_BCRYPT=ON
 jobs:
+  # Conan dependencies in their own job, so the cache is saved even if the main build fails.
+  deps:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: rui314/setup-mold@v1
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 16G /extra.swap && sudo chmod 600 /extra.swap && sudo mkswap /extra.swap >/dev/null && sudo swapon /extra.swap
+          df -h / ; free -h ; nproc
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+      - name: Conan dependencies
+        run: |
+          ./build/builder.sh /bin/bash -c "set -o pipefail; export CONAN_CPU_COUNT=$JOBS; nice -n 10 make build-3rdparty 2>&1 | tee deps.log | grep -E 'conan install failed|ERROR:' || true; test \${PIPESTATUS[0]} -eq 0"
+          tail -3 deps.log
+      - uses: ./.github/actions/cache-save
+        continue-on-error: true
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deps-log
+          path: deps.log
+          if-no-files-found: ignore
   build:
+    needs: deps
     runs-on: ubuntu-22.04
     timeout-minutes: 350
     steps:
@@ -35,7 +71,7 @@ jobs:
           kind: 'cpp'
       - name: Build
         run: |
-          ./build/builder.sh /bin/bash -c "set -o pipefail; export CMAKE_EXTRA_ARGS='-DFETCHCONTENT_SOURCE_DIR_MILVUS-STORAGE=/go/src/github.com/milvus-io/milvus/.ci-fips/ms -DWITH_EXTERNAL_TABLE_FORMATS=OFF'; make install $FLAGS 2>&1 | tee build.log | grep -E 'Installation successful|FAILED:|fatal error|Error [0-9]+$' || true; test \${PIPESTATUS[0]} -eq 0"
+          ./build/builder.sh /bin/bash -c "set -o pipefail; export jobs=$JOBS CONAN_CPU_COUNT=$JOBS CARGO_BUILD_JOBS=$JOBS; export CMAKE_EXTRA_ARGS='-DFETCHCONTENT_SOURCE_DIR_MILVUS-STORAGE=/go/src/github.com/milvus-io/milvus/.ci-fips/ms -DWITH_EXTERNAL_TABLE_FORMATS=OFF'; nice -n 10 make install $FLAGS 2>&1 | tee build.log | grep -E 'Installation successful|FAILED:|fatal error|Error [0-9]+$' || true; test \${PIPESTATUS[0]} -eq 0"
           tail -3 build.log; grep -q 'Installation successful' build.log
           grep -m3 -E 'milvus-storage version|no-default-features' build.log | cut -c1-200 || true
       - uses: ./.github/actions/cache-save
