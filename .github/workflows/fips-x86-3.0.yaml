@@ -39,9 +39,15 @@ jobs:
       # the last save failed on unreadable libiconv test files, so the build job rebuilt everything.
       - name: Shrink and fix permissions of the Conan cache
         run: |
-          ./build/builder.sh /bin/bash -c "conan cache clean '*'"
-          sudo chmod -R a+rX .docker
-          du -sh .docker/*
+          C=.docker/amd64-ubuntu22.04-conan2
+          sudo du -sh "$C" || true
+          # Run 43571972830 failed in this step without a readable log; nothing here may fail the job.
+          ./build/builder.sh /bin/bash -c "conan cache clean '*'" || {
+            echo "conan cache clean failed; removing source and build folders directly"
+            sudo find "$C/p" -mindepth 2 -maxdepth 3 -type d \( -name s -o -name b \) -prune -exec rm -rf {} + || true
+          }
+          sudo chmod -R a+rX .docker || true
+          sudo du -sh "$C" || true
       - uses: ./.github/actions/cache-save
         continue-on-error: true
         with:
