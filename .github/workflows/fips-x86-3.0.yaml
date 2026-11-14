@@ -9,6 +9,8 @@ env:
   MS_PIN: e5321520
   # 3 of the runner's 4 cores, so the runner agent isn't starved (an earlier run lost contact at -j4).
   JOBS: 3
+  # ENABLE_GCP_NATIVE=OFF is exported inside the build container (builder.sh re-sources .env, which sets ON):
+  # 3.0 lacks #51326, so gcp-native-storage misses the Conan include paths, and we deploy on Azure only.
   FLAGS: MILVUS_FIPS_ENABLED=ON MILVUS_FIPS_STRICT=ON TANTIVY_ANALYZER_REMOTE_TLS=OFF TANTIVY_ANALYZER_REMOTE_TLS_OPENSSL=ON MILVUS_NO_EMBED_ETCD=ON MILVUS_NO_BCRYPT=ON
 jobs:
   # Conan dependencies in their own job, so the cache is saved even if the main build fails.
@@ -33,6 +35,13 @@ jobs:
         run: |
           ./build/builder.sh /bin/bash -c "set -o pipefail; export CONAN_CPU_COUNT=$JOBS; nice -n 10 make build-3rdparty 2>&1 | tee deps.log | grep -E 'conan install failed|ERROR:' || true; test \${PIPESTATUS[0]} -eq 0"
           tail -3 deps.log
+      # Keep only built packages (drops source/build trees), and make every file readable:
+      # the last save failed on unreadable libiconv test files, so the build job rebuilt everything.
+      - name: Shrink and fix permissions of the Conan cache
+        run: |
+          ./build/builder.sh /bin/bash -c "conan cache clean '*'"
+          sudo chmod -R a+rX .docker
+          du -sh .docker/*
       - uses: ./.github/actions/cache-save
         continue-on-error: true
         with:
@@ -69,11 +78,17 @@ jobs:
         with:
           os: 'ubuntu22.04'
           kind: 'cpp'
+      # cache-save only warns when it fails; stop here rather than rebuild every dependency.
+      - name: Check the Conan cache was restored
+        run: test -d .docker/amd64-ubuntu22.04-conan2/p || { echo "::error::Conan cache from the deps job is missing"; exit 1; }
       - name: Build
         run: |
-          ./build/builder.sh /bin/bash -c "set -o pipefail; export jobs=$JOBS CONAN_CPU_COUNT=$JOBS CARGO_BUILD_JOBS=$JOBS; export CMAKE_EXTRA_ARGS='-DFETCHCONTENT_SOURCE_DIR_MILVUS-STORAGE=/go/src/github.com/milvus-io/milvus/.ci-fips/ms -DWITH_EXTERNAL_TABLE_FORMATS=OFF'; nice -n 10 make install $FLAGS 2>&1 | tee build.log | grep -E 'Installation successful|FAILED:|fatal error|Error [0-9]+$' || true; test \${PIPESTATUS[0]} -eq 0"
+          ./build/builder.sh /bin/bash -c "set -o pipefail; export jobs=$JOBS CONAN_CPU_COUNT=$JOBS CARGO_BUILD_JOBS=$JOBS ENABLE_GCP_NATIVE=OFF; export CMAKE_EXTRA_ARGS='-DFETCHCONTENT_SOURCE_DIR_MILVUS-STORAGE=/go/src/github.com/milvus-io/milvus/.ci-fips/ms -DWITH_EXTERNAL_TABLE_FORMATS=OFF'; nice -n 10 make install $FLAGS 2>&1 | tee build.log | grep -E 'Installation successful|FAILED:|fatal error|Error [0-9]+$' || true; test \${PIPESTATUS[0]} -eq 0"
           tail -3 build.log; grep -q 'Installation successful' build.log
           grep -m3 -E 'milvus-storage version|no-default-features' build.log | cut -c1-200 || true
+      - name: Fix permissions of the caches
+        if: always()
+        run: sudo chmod -R a+rX .docker
       - uses: ./.github/actions/cache-save
         if: always()
         continue-on-error: true
