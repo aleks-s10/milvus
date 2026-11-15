@@ -63,10 +63,10 @@ jobs:
           sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
           ulimit -c unlimited; cat /proc/sys/kernel/core_pattern
-      - name: PBKDF2 stress (spike image)
+      - name: PBKDF2 stress (spike image, GODEBUG=asyncpreemptoff=1)
         id: spike
         continue-on-error: true
-        run: SMOKE=stress.py E2E_OUT=$PWD/.ci-fips/logs/stress-spike bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/stress-spike.txt; exit ${PIPESTATUS[0]}
+        run: MILVUS_GODEBUG=asyncpreemptoff=1 SMOKE=stress.py E2E_OUT=$PWD/.ci-fips/logs/stress-spike bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/stress-spike.txt; exit ${PIPESTATUS[0]}
       - name: Backtrace (spike)
         if: always()
         run: bash .ci-fips/core-bt.sh fipslocal/milvus:spike spike 2>&1 | tee .ci-fips/logs/bt-spike.txt
