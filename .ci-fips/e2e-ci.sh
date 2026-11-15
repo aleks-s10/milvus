@@ -23,6 +23,10 @@ docker run -d --name ci-milvus --network $N --network-alias milvus -e ETCD_ENDPO
   -v $R/user.yaml:/milvus/configs/user.yaml:ro -v $C:/certs:ro -v $C/bundle.pem:/etc/ssl/certs/ca-certificates.crt:ro $IMG milvus run standalone >/dev/null
 for i in $(seq 120); do docker logs ci-milvus 2>&1 | grep -q 'Proxy successfully started\|Proxy wait for' && break; sleep 3; done; sleep 25
 docker run --rm --network $N -e REQUESTS_CA_BUNDLE=/c/bundle.pem -v $C:/c:ro -v $C:/certs:ro -v ci-pip:/root/.local -v $R:/e python:3.12-slim python /e/smoke.py 2>&1 | tee $OUT/smoke.txt | grep -E '^(OK|FAIL|RESULT)' | cut -c1-200
+# Diagnostics: how the Milvus container ended up, and memory on the runner.
+echo "milvus state: $(docker inspect ci-milvus --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} err={{.State.Error}} finished={{.State.FinishedAt}}' 2>&1)"
+free -m | head -3; sudo dmesg 2>/dev/null | grep -iE "oom|killed process|segfault" | tail -5
+docker logs ci-milvus 2>&1 | tail -15 | cut -c1-240
 docker logs ci-milvus > $OUT/milvus.log 2>&1
 PID=$(docker exec ci-milvus sh -c 'pidof milvus || pgrep milvus' | head -1); docker exec ci-milvus sh -c "grep -E 'ossl-modules|libssl|libcrypto' /proc/$PID/maps | awk '{print \$NF}' | sort -u" | tee $OUT/maps.txt
 grep -E 'OpenSSL FIPS mode|FIPS strict' $OUT/milvus.log | head -2

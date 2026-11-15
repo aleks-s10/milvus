@@ -8,7 +8,7 @@ permissions:
   contents: read
   actions: read
 env:
-  IMAGE_RUN: 43622553868
+  IMAGE_RUN: 43747989184  # spike image (no libsodium, Cyrus SASL, s2n)
 jobs:
   checks:
     runs-on: ubuntu-22.04
