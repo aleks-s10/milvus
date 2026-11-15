@@ -9,6 +9,7 @@ permissions:
   actions: read
 env:
   IMAGE_RUN: 43747989184  # spike image (no libsodium, Cyrus SASL, s2n)
+  CONTROL_RUN: 43663206892  # integrated image without the spike, same harness passed 21/21 on it
 jobs:
   checks:
     runs-on: ubuntu-22.04
@@ -22,6 +23,23 @@ jobs:
           github-token: ${{ github.token }}
       - name: Load image
         run: zstd -dc image.tar.zst | docker load && rm image.tar.zst
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: control
+          run-id: ${{ env.CONTROL_RUN }}
+          github-token: ${{ github.token }}
+      - name: Load control image
+        run: |
+          docker tag fipslocal/milvus:ci fipslocal/milvus:spike
+          zstd -dc control/image.tar.zst | docker load && rm -rf control
+          docker tag fipslocal/milvus:ci fipslocal/milvus:control
+          docker tag fipslocal/milvus:spike fipslocal/milvus:ci
+          docker images fipslocal/milvus --format '{{.Tag}} {{.ID}}'
+      - name: Runner CPU
+        run: |
+          grep -m1 'model name' /proc/cpuinfo; nproc
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx|avx2|avx512[a-z]*|sha_ni|bmi2|adx|vaes|vpclmulqdq|gfni|aes|pclmulqdq)$' | tr '\n' ' '; echo
       - name: In-house scan
         run: |
           mkdir -p .ci-fips/logs/scan x root/usr
@@ -35,8 +53,21 @@ jobs:
         run: |
           docker run --rm -v $PWD/.ci-fips/tt-server:/s -v $PWD/internal/core/thirdparty/tantivy/tantivy-binding/src/analyzer/gen:/gen:ro -e TT_GEN=/gen/milvus.proto.tokenizer.rs -w /s rust:1.85.0-bookworm cargo build --release --locked -q
           mkdir -p .ci-fips/tt-server-bin && cp .ci-fips/tt-server/target/release/tt-server .ci-fips/tt-server-bin/
-      - name: Smoke test
-        run: bash .ci-fips/e2e-ci.sh fipslocal/milvus:ci 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
+      - name: Smoke test (spike image, Milvus under gdb)
+        id: spike
+        continue-on-error: true
+        run: GDB=1 bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
+      - name: Crash backtrace
+        if: always()
+        run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e/milvus.log | head -120 || true
+      - name: Smoke test (control image, same runner)
+        id: control
+        continue-on-error: true
+        run: E2E_OUT=$PWD/.ci-fips/logs/e2e-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control.txt; exit ${PIPESTATUS[0]}
+      - name: Result
+        run: |
+          echo "spike=${{ steps.spike.outcome }} control=${{ steps.control.outcome }}"
+          [ "${{ steps.spike.outcome }}" = success ]
       - uses: actions/upload-artifact@v4
         if: always()
         with:
