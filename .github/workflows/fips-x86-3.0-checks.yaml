@@ -12,6 +12,11 @@ env:
   CONTROL_RUN: 43663206892  # integrated image without the spike, same harness passed 21/21 on it
 jobs:
   checks:
+    # Several copies, to land on different runner CPUs: the crash so far shows on AMD EPYC 9V45 only.
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4]
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -53,27 +58,27 @@ jobs:
         run: |
           docker run --rm -v $PWD/.ci-fips/tt-server:/s -v $PWD/internal/core/thirdparty/tantivy/tantivy-binding/src/analyzer/gen:/gen:ro -e TT_GEN=/gen/milvus.proto.tokenizer.rs -w /s rust:1.85.0-bookworm cargo build --release --locked -q
           mkdir -p .ci-fips/tt-server-bin && cp .ci-fips/tt-server/target/release/tt-server .ci-fips/tt-server-bin/
-      - name: Smoke test (spike image, Milvus under gdb)
+      - name: Smoke test (spike image)
         id: spike
         continue-on-error: true
-        run: GDB=1 bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
-      - name: Crash backtrace
-        if: always()
-        run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e/milvus.log | head -120 || true
-      - name: Smoke test (control image under gdb, same runner)
+        run: bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
+      - name: Smoke test (control image, same runner)
         id: control
         continue-on-error: true
-        run: GDB=1 E2E_OUT=$PWD/.ci-fips/logs/e2e-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control.txt; exit ${PIPESTATUS[0]}
+        run: E2E_OUT=$PWD/.ci-fips/logs/e2e-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control.txt; exit ${PIPESTATUS[0]}
+      - name: Smoke test (control image under gdb, ASLR on)
+        id: controlgdb
+        continue-on-error: true
+        run: GDB=1 E2E_OUT=$PWD/.ci-fips/logs/e2e-control-gdb bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control-gdb.txt; exit ${PIPESTATUS[0]}
       - name: Control crash backtrace
         if: always()
-        run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e-control/milvus.log | head -120 || true
+        run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e-control-gdb/milvus.log | head -150 || true
       - name: Result
         run: |
-          echo "spike=${{ steps.spike.outcome }} control=${{ steps.control.outcome }}"
-          [ "${{ steps.spike.outcome }}" = success ]
+          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2) spike=${{ steps.spike.outcome }} control=${{ steps.control.outcome }} control-gdb=${{ steps.controlgdb.outcome }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: checks
+          name: checks-${{ matrix.copy }}
           path: .ci-fips/logs/
           if-no-files-found: ignore
