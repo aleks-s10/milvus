@@ -153,7 +153,7 @@ jobs:
           ls x/m/lib/ossl-modules | tee -a .ci-fips/logs/scan/inhouse.txt
       - name: Build tokenizer test server
         run: |
-          docker run --rm -v $PWD/.ci-fips/tt-server:/s -w /s rust:1.85.0-bookworm cargo build --release --locked -q
+          docker run --rm -v $PWD/.ci-fips/tt-server:/s -v $PWD/internal/core/thirdparty/tantivy/tantivy-binding/src/analyzer/gen:/gen:ro -e TT_GEN=/gen/milvus.proto.tokenizer.rs -w /s rust:1.85.0-bookworm cargo build --release --locked -q
           mkdir -p .ci-fips/tt-server-bin && cp .ci-fips/tt-server/target/release/tt-server .ci-fips/tt-server-bin/
       - name: Smoke test
         run: bash .ci-fips/e2e-ci.sh fipslocal/milvus:ci 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}

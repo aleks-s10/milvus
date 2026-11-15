@@ -1,0 +1,45 @@
+# Fork test branch only, never proposed upstream: reruns only the checks job of
+# fips-x86-3.0.yaml against the image a finished run already built.
+name: FIPS x86-64 3.0 checks only
+on:
+  push:
+    branches: [ci/fips-x86-3.0-checks]
+permissions:
+  contents: read
+  actions: read
+env:
+  IMAGE_RUN: 43622553868
+jobs:
+  checks:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          run-id: ${{ env.IMAGE_RUN }}
+          github-token: ${{ github.token }}
+      - name: Load image
+        run: zstd -dc image.tar.zst | docker load && rm image.tar.zst
+      - name: In-house scan
+        run: |
+          mkdir -p .ci-fips/logs/scan x root/usr
+          cid=$(docker create fipslocal/milvus:ci); docker cp -q $cid:/milvus x/m; docker cp -q $cid:/usr/bin root/usr/bin; docker rm $cid >/dev/null
+          DV=$(grep '^DATE_VERSION=' .env | cut -d= -f2)
+          docker run --rm -v $PWD/x/m:/x:ro -v $PWD/root:/x-root:ro -v $PWD/.ci-fips/logs/scan:/out -v $PWD/.ci-fips:/l:ro --entrypoint bash milvusdb/milvus-env:ubuntu22.04-$DV /l/scan-inside.sh | tee .ci-fips/logs/scan/inhouse.txt
+          P=x/m/lib/libmilvus-planparser.so
+          docker run --rm -v $PWD/x/m:/x:ro --entrypoint bash milvusdb/milvus-env:ubuntu22.04-$DV -c 'go version -m /x/lib/libmilvus-planparser.so | grep -E "^\s+build\s+(-tags|GOEXPERIMENT)"; go tool nm /x/lib/libmilvus-planparser.so > /tmp/n; echo "planparser: etcdserver=$(grep -c go.etcd.io/etcd/server /tmp/n) bcrypt=$(grep -c x/crypto/bcrypt /tmp/n) boring=$(grep -c crypto/internal/boring /tmp/n)"' | tee -a .ci-fips/logs/scan/inhouse.txt
+          ls x/m/lib/ossl-modules | tee -a .ci-fips/logs/scan/inhouse.txt
+      - name: Build tokenizer test server
+        run: |
+          docker run --rm -v $PWD/.ci-fips/tt-server:/s -v $PWD/internal/core/thirdparty/tantivy/tantivy-binding/src/analyzer/gen:/gen:ro -e TT_GEN=/gen/milvus.proto.tokenizer.rs -w /s rust:1.85.0-bookworm cargo build --release --locked -q
+          mkdir -p .ci-fips/tt-server-bin && cp .ci-fips/tt-server/target/release/tt-server .ci-fips/tt-server-bin/
+      - name: Smoke test
+        run: bash .ci-fips/e2e-ci.sh fipslocal/milvus:ci 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks
+          path: .ci-fips/logs/
+          if-no-files-found: ignore
