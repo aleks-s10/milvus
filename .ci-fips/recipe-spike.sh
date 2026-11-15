@@ -22,7 +22,8 @@ cp -r "$(conan cache path "$AWSIO")" "$W/awsio"
 for name in folly awsio; do
   ref=$([ $name = folly ] && echo "$FOLLY" || echo "$AWSIO")
   es=$(conan cache path "$ref" --folder export_source 2>/dev/null || true)
-  [ -n "$es" ] && [ -d "$es" ] && cp -r "$es/." "$W/$name/" || true
+  # export_sources() copies files from the recipe folder into src/, so put them back at the top level.
+  [ -n "$es" ] && [ -d "$es/src" ] && cp -r "$es/src/." "$W/$name/" || true
 done
 
 python3 - "$W" <<'EOF'
