@@ -34,7 +34,10 @@ jobs:
           os: 'ubuntu22.04'
           kind: 'cpp'
       - name: Patched Conan recipes
-        run: ./build/builder.sh /bin/bash .ci-fips/recipe-spike.sh
+        run: |
+          ./build/builder.sh /bin/bash .ci-fips/recipe-spike.sh
+          # builder.sh runs chmod -R 777 .docker without sudo and exits if any file isn't ours.
+          sudo chown -R "$(id -u):$(id -g)" .docker
       - name: Conan dependencies
         run: |
           ./build/builder.sh /bin/bash -c "set -o pipefail; export CONAN_CPU_COUNT=$JOBS; nice -n 10 make build-3rdparty 2>&1 | tee deps.log | grep -E 'conan install failed|ERROR:' || true; test \${PIPESTATUS[0]} -eq 0"
@@ -90,7 +93,10 @@ jobs:
           kind: 'cpp'
       # cache-save only warns when it fails; stop here rather than rebuild every dependency.
       - name: Patched Conan recipes
-        run: ./build/builder.sh /bin/bash .ci-fips/recipe-spike.sh
+        run: |
+          ./build/builder.sh /bin/bash .ci-fips/recipe-spike.sh
+          # builder.sh runs chmod -R 777 .docker without sudo and exits if any file isn't ours.
+          sudo chown -R "$(id -u):$(id -g)" .docker
       - name: Check the Conan cache was restored
         run: test -d .docker/amd64-ubuntu22.04-conan2/p || { echo "::error::Conan cache from the deps job is missing"; exit 1; }
       - name: Build
