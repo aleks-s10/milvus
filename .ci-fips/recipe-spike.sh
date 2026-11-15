@@ -60,6 +60,26 @@ assert n >= 1, "aws-c-io s2n requires"
 s = s.replace('self.requires("s2n/', '(not self.options.byo_crypto) and self.requires("s2n/')
 s = sub(s, '        tc.variables["BUILD_TESTING"] = False\n',
         '        tc.variables["BUILD_TESTING"] = False\n        tc.cache_variables["BYO_CRYPTO"] = bool(self.options.byo_crypto)\n', "aws-c-io toolchain")
+# aws-c-io's CMake target sets BYO_CRYPTO as a PUBLIC define, but Conan doesn't pass CMake target
+# definitions on: export it, so aws-crt-cpp and aws-sdk-cpp compile their BYO_CRYPTO code paths
+# instead of calling TLS functions this aws-c-io build doesn't have.
+s = sub(s, '        self.cpp_info.libs = ["aws-c-io"]\n',
+        '        self.cpp_info.libs = ["aws-c-io"]\n        if self.options.byo_crypto:\n            self.cpp_info.defines.append("BYO_CRYPTO")\n', "aws-c-io package_info")
+# aws-c-http calls aws_tls_handler_protocol, which aws-c-io defines only in its non-BYO_CRYPTO
+# code. With BYO_CRYPTO no TLS context can be created, so no channel ever holds a TLS handler
+# and the accessor is unreachable; define it to report no negotiated protocol.
+s = sub(s, '    def build(self):\n        cmake = CMake(self)\n',
+        '    def build(self):\n'
+        '        if self.options.byo_crypto:\n'
+        '            save(self, os.path.join(self.source_folder, "source", "milvus_byo_crypto_stubs.c"),\n'
+        '                 "#include <aws/io/tls_channel_handler.h>\\n"\n'
+        '                 "struct aws_byte_buf aws_tls_handler_protocol(struct aws_channel_handler *handler) {\\n"\n'
+        '                 "    (void)handler;\\n"\n'
+        '                 "    struct aws_byte_buf empty;\\n"\n'
+        '                 "    AWS_ZERO_STRUCT(empty);\\n"\n'
+        '                 "    return empty;\\n"\n'
+        '                 "}\\n")\n'
+        '        cmake = CMake(self)\n', "aws-c-io build stub")
 open(p, "w").write(s)
 print("recipes patched")
 EOF

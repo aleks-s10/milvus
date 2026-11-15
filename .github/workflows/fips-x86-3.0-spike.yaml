@@ -40,14 +40,26 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" .docker
       - name: Conan dependencies
         run: |
-          ./build/builder.sh /bin/bash -c "set -o pipefail; export CONAN_CPU_COUNT=$JOBS; nice -n 10 make build-3rdparty 2>&1 | tee deps.log | grep -E 'conan install failed|ERROR:' || true; test \${PIPESTATUS[0]} -eq 0"
-          tail -3 deps.log
-          # make's exit status is lost in the pipeline above; fail on its messages instead.
-          ! grep -qE 'conan install failed|^make: \*\*\*' deps.log
+          # Retry when a download failed (cmake.org once served a certificate the builder rejected).
+          # Packages already built stay in the local cache, so a retry only redoes what's missing.
+          for attempt in 1 2 3; do
+            # builder.sh runs chmod -R 777 .docker without sudo and exits if any file isn't ours.
+            sudo chown -R "$(id -u):$(id -g)" .docker 2>/dev/null || true
+            rc=0; ./build/builder.sh /bin/bash -c "export CONAN_CPU_COUNT=$JOBS; nice -n 10 make build-3rdparty > deps.log 2>&1" || rc=$?
+            cp deps.log "deps-attempt$attempt.log"
+            grep -E 'conan install failed|ERROR:' deps.log | head -20 || true
+            if [ $rc -eq 0 ] && ! grep -qE 'conan install failed|^make: \*\*\*' deps.log; then tail -3 deps.log; exit 0; fi
+            grep -qE 'Error downloading|Max retries exceeded|Connection (reset|refused)|Read timed out' deps.log || break
+            echo "attempt $attempt failed on a download; retrying in 5 minutes"; sleep 300
+          done
+          tail -5 deps.log; exit 1
       # Keep only built packages (drops source/build trees), and make every file readable:
       # the last save failed on unreadable libiconv test files, so the build job rebuilt everything.
+      # Saved even when deps fail, so a rerun doesn't rebuild packages that already built.
       - name: Shrink and fix permissions of the Conan cache
+        if: always()
         run: |
+          sudo chown -R "$(id -u):$(id -g)" .docker 2>/dev/null || true
           C=.docker/amd64-ubuntu22.04-conan2
           sudo du -sh "$C" || true
           # Run 43571972830 failed in this step without a readable log; nothing here may fail the job.
@@ -58,6 +70,7 @@ jobs:
           sudo chmod -R a+rX .docker || true
           sudo du -sh "$C" || true
       - uses: ./.github/actions/cache-save
+        if: always()
         continue-on-error: true
         with:
           os: 'ubuntu22.04'
@@ -66,7 +79,7 @@ jobs:
         if: always()
         with:
           name: deps-log
-          path: deps.log
+          path: deps*.log
           if-no-files-found: ignore
   build:
     needs: deps
