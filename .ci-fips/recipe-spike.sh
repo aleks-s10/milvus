@@ -45,6 +45,11 @@ s = sub(s, '        if not is_msvc(self):\n            self.cpp_info.components[
         '        if self.options.with_libsodium:\n            self.cpp_info.components["libfolly"].requires.append("libsodium::libsodium")\n'
         '        if not is_msvc(self):\n            self.cpp_info.components["libfolly"].requires.append("libdwarf::libdwarf")', "folly cpp_info sodium")
 open(p, "w").write(s)
+# the recipe's conan_deps.cmake finds every dependency with REQUIRED; skip libsodium when it's disabled
+p = f"{w}/folly/conan_deps.cmake"; s = open(p).read()
+s = sub(s, 'custom_find_package(Libsodium LIBSODIUM)\n',
+        'if (NOT CMAKE_DISABLE_FIND_PACKAGE_Libsodium)\n    custom_find_package(Libsodium LIBSODIUM)\nendif()\n', "folly conan_deps.cmake")
+open(p, "w").write(s)
 
 # aws-c-io: BYO_CRYPTO option, which builds no TLS implementation and drops s2n
 p = f"{w}/awsio/conanfile.py"; s = open(p).read()
