@@ -13,14 +13,16 @@ cd /go/src/github.com/milvus-io/milvus
 
 FOLLY=folly/2026.04.20.00@milvus/dev#06852bea5b6449f0c4eb0df002b5779c
 AWSIO=aws-c-io/1.1.1#2dd777871cf93ce4f35ba714a1ba87ef
+CRT=aws-crt-cpp/0.44.3#43f6408847655d35224320f4774bfcb9
 W=$(mktemp -d)
-for ref in "$FOLLY" "$AWSIO"; do
+for ref in "$FOLLY" "$AWSIO" "$CRT"; do
   conan cache path "$ref" >/dev/null 2>&1 || conan download "$ref" -r default-conan-local2 --only-recipe >/dev/null
 done
 cp -r "$(conan cache path "$FOLLY")" "$W/folly"
 cp -r "$(conan cache path "$AWSIO")" "$W/awsio"
-for name in folly awsio; do
-  ref=$([ $name = folly ] && echo "$FOLLY" || echo "$AWSIO")
+cp -r "$(conan cache path "$CRT")" "$W/crt"
+for name in folly awsio crt; do
+  case $name in folly) ref=$FOLLY;; awsio) ref=$AWSIO;; crt) ref=$CRT;; esac
   es=$(conan cache path "$ref" --folder export_source 2>/dev/null || true)
   # export_sources() copies files from the recipe folder into src/, so put them back at the top level.
   [ -n "$es" ] && [ -d "$es/src" ] && cp -r "$es/src/." "$W/$name/" || true
@@ -81,23 +83,33 @@ s = sub(s, '    def build(self):\n        cmake = CMake(self)\n',
         '                 "}\\n")\n'
         '        cmake = CMake(self)\n', "aws-c-io build stub")
 open(p, "w").write(s)
+
+# aws-crt-cpp: its .cpp files compile differently under BYO_CRYPTO (its headers don't), but Conan's
+# default package_id ignores the options of a shared dependency, so a cached non-BYO_CRYPTO binary
+# would be reused and fail to link. Make aws-c-io's options part of aws-crt-cpp's package_id.
+p = f"{w}/crt/conanfile.py"; s = open(p).read()
+s = sub(s, '    def requirements(self):\n',
+        '    def package_id(self):\n        self.info.requires["aws-c-io"].full_package_mode()\n\n    def requirements(self):\n', "aws-crt-cpp package_id")
+open(p, "w").write(s)
 print("recipes patched")
 EOF
 
 rev() { conan export "$1" "${@:2}" 2>&1 | tee /dev/stderr | grep -oE 'Exported: [^#]+#[0-9a-f]+' | tail -1 | sed 's/.*#//'; }
 FR=$(rev "$W/folly" --name folly --version 2026.04.20.00 --user milvus --channel dev)
 AR=$(rev "$W/awsio" --name aws-c-io --version 1.1.1)
-[ -n "$FR" ] && [ -n "$AR" ] || { echo "export failed"; exit 1; }
-echo "folly patched revision: $FR"; echo "aws-c-io patched revision: $AR"
+CR=$(rev "$W/crt" --name aws-crt-cpp --version 0.44.3)
+[ -n "$FR" ] && [ -n "$AR" ] && [ -n "$CR" ] || { echo "export failed"; exit 1; }
+echo "folly patched revision: $FR"; echo "aws-c-io patched revision: $AR"; echo "aws-crt-cpp patched revision: $CR"
 
-python3 - "$FR" "$AR" <<'EOF'
+python3 - "$FR" "$AR" "$CR" <<'EOF'
 import sys, re
-fr, ar = sys.argv[1], sys.argv[2]
+fr, ar, cr = sys.argv[1], sys.argv[2], sys.argv[3]
 p = "internal/core/conanfile.py"; s = open(p).read()
 # folly is a direct requirement that other packages also require at the original revision:
 # move it out of the requires tuple and force the patched revision on the whole graph.
 s = re.sub(r'\n\s*"folly/2026\.04\.20\.00@milvus/dev#[0-9a-f]+",', '', s, count=1)
 s = re.sub(r'\n\s*self\.requires\("(folly|aws-c-io)/[^"]+", (force|override)=True\)', '', s)
+s = re.sub(r'self\.requires\("aws-crt-cpp/0\.44\.3#[0-9a-f]+"(, force=True)?\)', f'self.requires("aws-crt-cpp/0.44.3#{cr}", force=True)', s, count=1)
 anchor = '        self.requires("aws-crt-cpp/'
 assert anchor in s, "aws-crt-cpp requires anchor"
 s = s.replace(anchor, f'        self.requires("folly/2026.04.20.00@milvus/dev#{fr}", force=True)\n'
