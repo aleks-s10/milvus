@@ -42,6 +42,8 @@ jobs:
         run: |
           ./build/builder.sh /bin/bash -c "set -o pipefail; export CONAN_CPU_COUNT=$JOBS; nice -n 10 make build-3rdparty 2>&1 | tee deps.log | grep -E 'conan install failed|ERROR:' || true; test \${PIPESTATUS[0]} -eq 0"
           tail -3 deps.log
+          # make's exit status is lost in the pipeline above; fail on its messages instead.
+          ! grep -qE 'conan install failed|^make: \*\*\*' deps.log
       # Keep only built packages (drops source/build trees), and make every file readable:
       # the last save failed on unreadable libiconv test files, so the build job rebuilt everything.
       - name: Shrink and fix permissions of the Conan cache

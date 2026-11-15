@@ -68,13 +68,14 @@ python3 - "$FR" "$AR" <<'EOF'
 import sys, re
 fr, ar = sys.argv[1], sys.argv[2]
 p = "internal/core/conanfile.py"; s = open(p).read()
-s = re.sub(r'"folly/2026\.04\.20\.00@milvus/dev#[0-9a-f]+"', f'"folly/2026.04.20.00@milvus/dev#{fr}"', s, count=1)
-if "aws-c-io/1.1.1#" not in s:
-    anchor = '        self.requires("aws-crt-cpp/'
-    assert anchor in s, "aws-crt-cpp requires anchor"
-    s = s.replace(anchor, f'        self.requires("aws-c-io/1.1.1#{ar}", override=True)\n' + anchor, 1)
-else:
-    s = re.sub(r'aws-c-io/1\.1\.1#[0-9a-f]+', f'aws-c-io/1.1.1#{ar}', s)
+# folly is a direct requirement that other packages also require at the original revision:
+# move it out of the requires tuple and force the patched revision on the whole graph.
+s = re.sub(r'\n\s*"folly/2026\.04\.20\.00@milvus/dev#[0-9a-f]+",', '', s, count=1)
+s = re.sub(r'\n\s*self\.requires\("(folly|aws-c-io)/[^"]+", (force|override)=True\)', '', s)
+anchor = '        self.requires("aws-crt-cpp/'
+assert anchor in s, "aws-crt-cpp requires anchor"
+s = s.replace(anchor, f'        self.requires("folly/2026.04.20.00@milvus/dev#{fr}", force=True)\n'
+                      f'        self.requires("aws-c-io/1.1.1#{ar}", override=True)\n' + anchor, 1)
 open(p, "w").write(s)
 print("conanfile pinned")
 EOF
