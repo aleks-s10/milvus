@@ -60,10 +60,13 @@ jobs:
       - name: Crash backtrace
         if: always()
         run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e/milvus.log | head -120 || true
-      - name: Smoke test (control image, same runner)
+      - name: Smoke test (control image under gdb, same runner)
         id: control
         continue-on-error: true
-        run: E2E_OUT=$PWD/.ci-fips/logs/e2e-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control.txt; exit ${PIPESTATUS[0]}
+        run: GDB=1 E2E_OUT=$PWD/.ci-fips/logs/e2e-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control.txt; exit ${PIPESTATUS[0]}
+      - name: Control crash backtrace
+        if: always()
+        run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e-control/milvus.log | head -120 || true
       - name: Result
         run: |
           echo "spike=${{ steps.spike.outcome }} control=${{ steps.control.outcome }}"
