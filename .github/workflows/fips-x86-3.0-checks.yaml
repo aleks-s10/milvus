@@ -58,24 +58,28 @@ jobs:
         run: |
           docker run --rm -v $PWD/.ci-fips/tt-server:/s -v $PWD/internal/core/thirdparty/tantivy/tantivy-binding/src/analyzer/gen:/gen:ro -e TT_GEN=/gen/milvus.proto.tokenizer.rs -w /s rust:1.85.0-bookworm cargo build --release --locked -q
           mkdir -p .ci-fips/tt-server-bin && cp .ci-fips/tt-server/target/release/tt-server .ci-fips/tt-server-bin/
-      - name: Smoke test (spike image)
+      - name: Core dumps on
+        run: |
+          sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
+          ulimit -c unlimited; cat /proc/sys/kernel/core_pattern
+      - name: PBKDF2 stress (spike image)
         id: spike
         continue-on-error: true
-        run: bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/e2e.txt; exit ${PIPESTATUS[0]}
-      - name: Smoke test (control image, same runner)
+        run: SMOKE=stress.py E2E_OUT=$PWD/.ci-fips/logs/stress-spike bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/stress-spike.txt; exit ${PIPESTATUS[0]}
+      - name: Backtrace (spike)
+        if: always()
+        run: bash .ci-fips/core-bt.sh fipslocal/milvus:spike spike 2>&1 | tee .ci-fips/logs/bt-spike.txt
+      - name: PBKDF2 stress (control image)
         id: control
         continue-on-error: true
-        run: E2E_OUT=$PWD/.ci-fips/logs/e2e-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control.txt; exit ${PIPESTATUS[0]}
-      - name: Smoke test (control image under gdb, ASLR on)
-        id: controlgdb
-        continue-on-error: true
-        run: GDB=1 E2E_OUT=$PWD/.ci-fips/logs/e2e-control-gdb bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/e2e-control-gdb.txt; exit ${PIPESTATUS[0]}
-      - name: Control crash backtrace
+        run: SMOKE=stress.py E2E_OUT=$PWD/.ci-fips/logs/stress-control bash .ci-fips/e2e-ci.sh fipslocal/milvus:control 2>&1 | tee .ci-fips/logs/stress-control.txt; exit ${PIPESTATUS[0]}
+      - name: Backtrace (control)
         if: always()
-        run: sed -n '/CRASH BACKTRACE/,$p' .ci-fips/logs/e2e-control-gdb/milvus.log | head -150 || true
+        run: bash .ci-fips/core-bt.sh fipslocal/milvus:control control 2>&1 | tee .ci-fips/logs/bt-control.txt
       - name: Result
         run: |
-          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2) spike=${{ steps.spike.outcome }} control=${{ steps.control.outcome }} control-gdb=${{ steps.controlgdb.outcome }}"
+          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2) spike=${{ steps.spike.outcome }} control=${{ steps.control.outcome }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

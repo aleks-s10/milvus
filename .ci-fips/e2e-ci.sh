@@ -20,10 +20,11 @@ AZ='DefaultEndpointsProtocol=https;AccountName=devstoreaccount1;AccountKey=Eby8v
 docker volume create ci-pip >/dev/null
 docker run --rm --network $N -e REQUESTS_CA_BUNDLE=/c/bundle.pem -v $C:/c:ro -v ci-pip:/root/.local python:3.12-slim bash -c "pip install --user -q azure-storage-blob 'pymilvus>=2.6' 2>&1 | tail -1; python -c \"from azure.storage.blob import BlobServiceClient as B; B.from_connection_string('$AZ').create_container('milvus-v3'); print('container created over https')\""
 if [ "${GDB:-0}" = 1 ]; then RUNMODE="--user root --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -v $R/milvus-gdb.sh:/gdb.sh:ro --entrypoint bash $IMG /gdb.sh"; else RUNMODE="$IMG milvus run standalone"; fi
-docker run -d --name ci-milvus --network $N --network-alias milvus -e ETCD_ENDPOINTS=etcd:2379 -e DEPLOY_MODE=STANDALONE -e USE_AZURITE=true -e "AZURE_STORAGE_CONNECTION_STRING=$AZ" -e SSL_CERT_FILE=/certs/bundle.pem \
+CORE="--ulimit core=-1 -v /tmp/cores:/tmp/cores -e GOTRACEBACK=crash"
+docker run -d --name ci-milvus $CORE --network $N --network-alias milvus -e ETCD_ENDPOINTS=etcd:2379 -e DEPLOY_MODE=STANDALONE -e USE_AZURITE=true -e "AZURE_STORAGE_CONNECTION_STRING=$AZ" -e SSL_CERT_FILE=/certs/bundle.pem \
   -v $R/user.yaml:/milvus/configs/user.yaml:ro -v $C:/certs:ro -v $C/bundle.pem:/etc/ssl/certs/ca-certificates.crt:ro $RUNMODE >/dev/null
 for i in $(seq 120); do docker logs ci-milvus 2>&1 | grep -q 'Proxy successfully started\|Proxy wait for' && break; sleep 3; done; sleep 25
-docker run --rm --network $N -e REQUESTS_CA_BUNDLE=/c/bundle.pem -v $C:/c:ro -v $C:/certs:ro -v ci-pip:/root/.local -v $R:/e python:3.12-slim python /e/smoke.py 2>&1 | tee $OUT/smoke.txt | grep -E '^(OK|FAIL|RESULT)' | cut -c1-200
+docker run --rm --network $N -e REQUESTS_CA_BUNDLE=/c/bundle.pem -v $C:/c:ro -v $C:/certs:ro -v ci-pip:/root/.local -v $R:/e python:3.12-slim python /e/${SMOKE:-smoke.py} 2>&1 | tee $OUT/smoke.txt | grep -E '^(OK|FAIL|RESULT)' | cut -c1-200
 # Diagnostics: how the Milvus container ended up, and memory on the runner.
 echo "milvus state: $(docker inspect ci-milvus --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} err={{.State.Error}} finished={{.State.FinishedAt}}' 2>&1)"
 free -m | head -3; sudo dmesg 2>/dev/null | grep -iE "oom|killed process|segfault" | tail -5
@@ -36,4 +37,4 @@ E=$(grep -cE 'panic|\[ERROR\]' $OUT/milvus.log); echo "panic/ERROR lines: $E"; g
 docker run -d --name ci-embed --network $N -e DEPLOY_MODE=STANDALONE -e ETCD_USE_EMBED=true $IMG milvus run standalone >/dev/null; sleep 30
 docker logs ci-embed > $OUT/embed.log 2>&1; EMB=$(grep -c 'embedded etcd is not supported in this build' $OUT/embed.log); echo "embedded etcd refused: $EMB"
 docker rm -f ci-etcd ci-azurite ci-milvus ci-embed ci-s1 ci-s2 ci-s4 >/dev/null 2>&1
-grep -q '^RESULT PASS' $OUT/smoke.txt && [ "$E" = 0 ] && [ "$EMB" -ge 1 ]
+grep -qE '^(RESULT|STRESS) PASS' $OUT/smoke.txt && [ "$E" = 0 ] && [ "$EMB" -ge 1 ]
