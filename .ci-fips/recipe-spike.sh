@@ -13,20 +13,20 @@ cd /go/src/github.com/milvus-io/milvus
 
 FOLLY=folly/2026.04.20.00@milvus/dev#06852bea5b6449f0c4eb0df002b5779c
 AWSIO=aws-c-io/1.1.1#2dd777871cf93ce4f35ba714a1ba87ef
-CRT=aws-crt-cpp/0.44.3#43f6408847655d35224320f4774bfcb9
+# Packages whose sources have BYO_CRYPTO code paths and call aws-c-io's TLS functions directly
+# (found by grepping every aws-* source). Their binaries must be rebuilt when aws-c-io changes mode.
+BYO_CONSUMERS="aws-crt-cpp/0.44.3#43f6408847655d35224320f4774bfcb9 aws-c-auth/1.0.2#f587952f127cc579b90265a0f35056df aws-c-http/1.1.1#4ebd9cad4c949ed136f95419ce0ceee3 aws-c-s3/1.5.1#41f018ea69dd13668a2ffe76d0731742"
 W=$(mktemp -d)
-for ref in "$FOLLY" "$AWSIO" "$CRT"; do
-  conan cache path "$ref" >/dev/null 2>&1 || conan download "$ref" -r default-conan-local2 --only-recipe >/dev/null
-done
-cp -r "$(conan cache path "$FOLLY")" "$W/folly"
-cp -r "$(conan cache path "$AWSIO")" "$W/awsio"
-cp -r "$(conan cache path "$CRT")" "$W/crt"
-for name in folly awsio crt; do
-  case $name in folly) ref=$FOLLY;; awsio) ref=$AWSIO;; crt) ref=$CRT;; esac
-  es=$(conan cache path "$ref" --folder export_source 2>/dev/null || true)
+copy_recipe() {  # <ref> <dir>
+  conan cache path "$1" >/dev/null 2>&1 || conan download "$1" -r default-conan-local2 --only-recipe >/dev/null
+  cp -r "$(conan cache path "$1")" "$W/$2"
+  local es; es=$(conan cache path "$1" --folder export_source 2>/dev/null || true)
   # export_sources() copies files from the recipe folder into src/, so put them back at the top level.
-  [ -n "$es" ] && [ -d "$es/src" ] && cp -r "$es/src/." "$W/$name/" || true
-done
+  [ -n "$es" ] && [ -d "$es/src" ] && cp -r "$es/src/." "$W/$2/" || true
+}
+copy_recipe "$FOLLY" folly
+copy_recipe "$AWSIO" awsio
+for ref in $BYO_CONSUMERS; do n=${ref%%/*}; copy_recipe "$ref" "c-$n"; done
 
 python3 - "$W" <<'EOF'
 import sys, re
@@ -84,37 +84,52 @@ s = sub(s, '    def build(self):\n        cmake = CMake(self)\n',
         '        cmake = CMake(self)\n', "aws-c-io build stub")
 open(p, "w").write(s)
 
-# aws-crt-cpp: its .cpp files compile differently under BYO_CRYPTO (its headers don't), but Conan's
-# default package_id ignores the options of a shared dependency, so a cached non-BYO_CRYPTO binary
-# would be reused and fail to link. Make aws-c-io's options part of aws-crt-cpp's package_id.
-p = f"{w}/crt/conanfile.py"; s = open(p).read()
-s = sub(s, '    def requirements(self):\n',
-        '    def package_id(self):\n        self.info.requires["aws-c-io"].full_package_mode()\n\n    def requirements(self):\n', "aws-crt-cpp package_id")
-open(p, "w").write(s)
+# BYO_CRYPTO consumers: their sources compile differently under BYO_CRYPTO, but Conan's default
+# package_id ignores a shared dependency's options, so cached non-BYO_CRYPTO binaries would be
+# reused and fail to link (seen with aws-crt-cpp, then aws-c-s3). Make aws-c-io's options part of
+# their package_id.
+import glob, os
+for d in sorted(glob.glob(f"{w}/c-*")):
+    p = f"{d}/conanfile.py"; s = open(p).read()
+    assert "def package_id" not in s, f"{d}: already has package_id"
+    s = sub(s, '    def requirements(self):\n',
+            '    def package_id(self):\n        self.info.requires["aws-c-io"].full_package_mode()\n\n    def requirements(self):\n', f"{os.path.basename(d)} package_id")
+    open(p, "w").write(s)
 print("recipes patched")
 EOF
 
 rev() { conan export "$1" "${@:2}" 2>&1 | tee /dev/stderr | grep -oE 'Exported: [^#]+#[0-9a-f]+' | tail -1 | sed 's/.*#//'; }
 FR=$(rev "$W/folly" --name folly --version 2026.04.20.00 --user milvus --channel dev)
 AR=$(rev "$W/awsio" --name aws-c-io --version 1.1.1)
-CR=$(rev "$W/crt" --name aws-crt-cpp --version 0.44.3)
-[ -n "$FR" ] && [ -n "$AR" ] && [ -n "$CR" ] || { echo "export failed"; exit 1; }
-echo "folly patched revision: $FR"; echo "aws-c-io patched revision: $AR"; echo "aws-crt-cpp patched revision: $CR"
+[ -n "$FR" ] && [ -n "$AR" ] || { echo "export failed"; exit 1; }
+echo "folly patched revision: $FR"; echo "aws-c-io patched revision: $AR"
+PINS=""
+for ref in $BYO_CONSUMERS; do
+  n=${ref%%/*}; v=${ref#*/}; v=${v%%#*}
+  r=$(rev "$W/c-$n" --name "$n" --version "$v"); [ -n "$r" ] || { echo "export failed: $n"; exit 1; }
+  echo "$n patched revision: $r"; PINS="$PINS $n/$v#$r"
+done
 
-python3 - "$FR" "$AR" "$CR" <<'EOF'
+python3 - "$FR" "$AR" $PINS <<'EOF'
 import sys, re
-fr, ar, cr = sys.argv[1], sys.argv[2], sys.argv[3]
+fr, ar, pins = sys.argv[1], sys.argv[2], sys.argv[3:]
 p = "internal/core/conanfile.py"; s = open(p).read()
 # folly is a direct requirement that other packages also require at the original revision:
 # move it out of the requires tuple and force the patched revision on the whole graph.
 s = re.sub(r'\n\s*"folly/2026\.04\.20\.00@milvus/dev#[0-9a-f]+",', '', s, count=1)
-s = re.sub(r'\n\s*self\.requires\("(folly|aws-c-io)/[^"]+", (force|override)=True\)', '', s)
-s = re.sub(r'self\.requires\("aws-crt-cpp/0\.44\.3#[0-9a-f]+"(, force=True)?\)', f'self.requires("aws-crt-cpp/0.44.3#{cr}", force=True)', s, count=1)
+s = re.sub(r'\n\s*self\.requires\("(folly|aws-c-io|aws-c-auth|aws-c-http|aws-c-s3)/[^"]+", (force|override)=True\)', '', s)
+for pin in pins:
+    if pin.startswith("aws-crt-cpp/"):
+        # direct requirement of Milvus: swap its pin in place
+        s, n = re.subn(r'self\.requires\("aws-crt-cpp/0\.44\.3#[0-9a-f]+"(, force=True)?\)', f'self.requires("{pin}", force=True)', s, count=1)
+        assert n == 1, "aws-crt-cpp pin"
 anchor = '        self.requires("aws-crt-cpp/'
 assert anchor in s, "aws-crt-cpp requires anchor"
 s = s.replace(anchor, f'        self.requires("folly/2026.04.20.00@milvus/dev#{fr}", force=True)\n'
-                      f'        self.requires("aws-c-io/1.1.1#{ar}", override=True)\n' + anchor, 1)
+                      f'        self.requires("aws-c-io/1.1.1#{ar}", override=True)\n'
+                      + "".join(f'        self.requires("{pin}", override=True)\n' for pin in pins if not pin.startswith("aws-crt-cpp/"))
+                      + anchor, 1)
 open(p, "w").write(s)
 print("conanfile pinned")
 EOF
-grep -nE 'folly/2026|aws-c-io|sasl|s3-crt|with_libsodium|byo_crypto|libsodium' internal/core/conanfile.py
+grep -nE 'folly/2026|aws-c-io|aws-c-auth|aws-c-http|aws-c-s3|aws-crt-cpp/|sasl|s3-crt|with_libsodium|byo_crypto|libsodium' internal/core/conanfile.py
