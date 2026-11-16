@@ -8,8 +8,8 @@ permissions:
   contents: read
   actions: read
 env:
-  IMAGE_RUN: 43747989184  # spike image (no libsodium, Cyrus SASL, s2n)
-  CONTROL_RUN: 43663206892  # integrated image without the spike, same harness passed 21/21 on it
+  IMAGE_RUN: 43779189562  # integrated image with the patched cgosymbolizer (3a); tagged "spike" below
+  CONTROL_RUN: 43663206892  # integrated image with the original cgosymbolizer: crashed 4 of 4
 jobs:
   checks:
     # Several copies, to land on different runner CPUs: the crash so far shows on AMD EPYC 9V45 only.
@@ -63,10 +63,10 @@ jobs:
           sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
           ulimit -c unlimited; cat /proc/sys/kernel/core_pattern
-      - name: PBKDF2 stress (spike image, GODEBUG=asyncpreemptoff=1)
+      - name: PBKDF2 stress (3a image, no GODEBUG)
         id: spike
         continue-on-error: true
-        run: MILVUS_GODEBUG=asyncpreemptoff=1 SMOKE=stress.py E2E_OUT=$PWD/.ci-fips/logs/stress-spike bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/stress-spike.txt; exit ${PIPESTATUS[0]}
+        run: SMOKE=stress.py E2E_OUT=$PWD/.ci-fips/logs/stress-spike bash .ci-fips/e2e-ci.sh fipslocal/milvus:spike 2>&1 | tee .ci-fips/logs/stress-spike.txt; exit ${PIPESTATUS[0]}
       - name: Backtrace (spike)
         if: always()
         run: bash .ci-fips/core-bt.sh fipslocal/milvus:spike spike 2>&1 | tee .ci-fips/logs/bt-spike.txt
